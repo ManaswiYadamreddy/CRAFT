@@ -23,8 +23,8 @@ Dependencies:
 import torch
 import torch.nn as nn
 
-from residual_vq import ResidualVQ
-from face_parser import FaceParser, REGION_NAMES
+from .residual_vq import ResidualVQ
+from .face_parser import FaceParser, REGION_NAMES
 
 
 class RegionAwareVQ(nn.Module):

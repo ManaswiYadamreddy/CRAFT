@@ -45,10 +45,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FFHQPairedDataset
-from vqvae import VQVAE, GlobalVQ, build_hq_vqvae, build_lq_vqvae
-from region_aware_vq import RegionAwareVQ
-from losses import Stage1VQLoss
+from data.dataset import FFHQPairedDataset
+from models.vqvae import VQVAE, GlobalVQ, build_hq_vqvae, build_lq_vqvae
+from models.region_aware_vq import RegionAwareVQ
+from losses.losses import Stage1VQLoss
 
 
 # ======================================================================
@@ -439,7 +439,7 @@ def parse_args():
                         help="Training phase: A (HQ), B (LQ), C (assoc), or all")
 
     # Data
-    parser.add_argument("--data_root", type=str, required=True,
+    parser.add_argument("--data_root", type=str, default= "/projectnb/cs585/projects/craft/data/train", required=True,
                         help="Path to train/ directory with images512x512/ and LQ_images_512x512/")
     parser.add_argument("--num_workers", type=int, default=4)
 
@@ -451,7 +451,7 @@ def parse_args():
                         help="Residual quantization levels for LQ branch")
 
     # Face parser
-    parser.add_argument("--parser_ckpt", type=str, default="pretrained/79999_iter.pth",
+    parser.add_argument("--parser_ckpt", type=str, default="/projectnb/cs585/projects/craft/pretrained/79999_iter.pth",
                         help="Path to BiSeNet face parsing checkpoint")
 
     # Training hyperparameters

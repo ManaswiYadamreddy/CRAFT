@@ -4,7 +4,7 @@ test_pipeline.py — Pre-flight check for CRAFT Stage 1 training.
 Run BEFORE starting actual training to verify everything works.
 
 Usage:
-    python test_pipeline.py --data_root data/train
+    python test_pipeline.py --data_root /projectnb/cs585/projects/craft/data/train
     python test_pipeline.py --data_root data/train --parser_ckpt pretrained/79999_iter.pth
     python test_pipeline.py --data_root data/train --skip_fullres
 """
@@ -50,12 +50,12 @@ def run_tests(args):
     sep("Test 1: Imports")
     # ==================================================================
     try:
-        from residual_vq import ResidualVQ, VQLevel
-        from face_parser import FaceParser, REGION_NAMES, REGION_MAP
-        from region_aware_vq import RegionAwareVQ
-        from losses import Stage1VQLoss, VGGPerceptualLoss, PatchDiscriminator
-        from dataset import FFHQPairedDataset
-        from vqvae import VQVAE, GlobalVQ, build_hq_vqvae, build_lq_vqvae
+        from models.residual_vq import ResidualVQ, VQLevel
+        from models.face_parser import FaceParser, REGION_NAMES, REGION_MAP
+        from models.region_aware_vq import RegionAwareVQ
+        from losses.losses import Stage1VQLoss, VGGPerceptualLoss, PatchDiscriminator
+        from data.dataset import FFHQPairedDataset
+        from models.vqvae import VQVAE, GlobalVQ, build_hq_vqvae, build_lq_vqvae
         from train_stage1 import train_one_epoch
         from torch.utils.data import DataLoader
         ok("All imports successful")
@@ -324,8 +324,8 @@ def run_tests(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, required=True)
-    p.add_argument("--parser_ckpt", type=str, default="pretrained/79999_iter.pth")
+    p.add_argument("--data_root", default = "/projectnb/cs585/projects/craft/data/train",type=str, required=True)
+    p.add_argument("--parser_ckpt", type=str, default="/projectnb/cs585/projects/craft/pretrained/79999_iter.pth")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--skip_fullres", action="store_true")
     sys.exit(0 if run_tests(p.parse_args()) else 1)

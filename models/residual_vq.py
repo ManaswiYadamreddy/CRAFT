@@ -118,12 +118,14 @@ class VQLevel(nn.Module):
     @torch.no_grad()
     def _expire_dead_codes(self, z_flat, indices, threshold=1.0):
         """
-        Replace codebook entries that are rarely used (dead codes) 
+        Replace codebook entries that are rarely used (dead codes)
         with randomly sampled encoder outputs.
-        
+
         Called periodically during training to recover from partial collapse.
+
+        DDP safety: replacement vectors are chosen on rank 0 and broadcast
+        so all ranks update to the same codebook entries.
         """
-        counts = F.one_hot(indices, self.n_codes).float().sum(0)
         dead_mask = self.ema_count < threshold  # codes with very few assignments
         n_dead = dead_mask.sum().item()
 
@@ -134,8 +136,14 @@ class VQLevel(nn.Module):
         n_available = z_flat.shape[0]
         if n_available > 0:
             replace_indices = torch.randint(0, n_available, (n_dead,), device=z_flat.device)
-            self.embedding.weight.data[dead_mask] = z_flat[replace_indices]
-            self.ema_weight.data[dead_mask] = z_flat[replace_indices]
+            replacements = z_flat[replace_indices]
+
+            # In DDP, broadcast replacements from rank 0 to prevent codebook divergence
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.broadcast(replacements, src=0)
+
+            self.embedding.weight.data[dead_mask] = replacements
+            self.ema_weight.data[dead_mask] = replacements
             self.ema_count[dead_mask] = 1.0
 
         return n_dead

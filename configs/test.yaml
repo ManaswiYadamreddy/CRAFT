@@ -1,0 +1,14 @@
+# CRAFT Stage 1 — Test / pre-flight configuration
+# Usage: python test_pipeline.py --config configs/test.yaml
+
+# Data
+data_root: /projectnb/cs585/projects/craft/data/train
+
+# Face parser
+parser_ckpt: /projectnb/cs585/projects/craft/pretrained/79999_iter.pth
+
+# Device
+device: cuda
+
+# Skip full-resolution smoke test (faster pre-flight)
+skip_fullres: false

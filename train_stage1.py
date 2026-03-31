@@ -11,7 +11,12 @@ Three training phases:
                                 loss. λ_assoc = 1.
 
 Usage:
-    # Phase A: Train HQ VQVAE
+    # Using config file (recommended):
+    python train_stage1.py --config configs/train.yaml
+    python train_stage1.py --config configs/train.yaml --phase A
+    python train_stage1.py --config configs/train.yaml --phase C --grad_clip_norm 1.0
+
+    # Without config file (CLI-only):
     python train_stage1.py --phase A --data_root data/train --batch_size 32
 
     # Phase B: Train LQ VQVAE (requires Phase A checkpoint)
@@ -37,18 +42,49 @@ Hyperparameters (from OSDFace):
 
 import argparse
 import json
+import math
 import os
 import time
+import yaml
 from collections import defaultdict
 
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
 from torch.utils.data import DataLoader
 
 from data.dataset import FFHQPairedDataset
 from models.vqvae import VQVAE, GlobalVQ, build_hq_vqvae, build_lq_vqvae
 from models.region_aware_vq import RegionAwareVQ
 from losses.losses import Stage1VQLoss
+
+
+def _is_main_process():
+    """Return True if this is rank 0 or not running under DDP."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
+def _build_scheduler(optimizer, args, total_epochs):
+    """Build LR scheduler based on args.lr_schedule."""
+    if args.lr_schedule == "none":
+        return None
+    if args.lr_schedule == "cosine":
+        if args.warmup_epochs > 0:
+            warmup = LinearLR(
+                optimizer, start_factor=1e-2, total_iters=args.warmup_epochs,
+            )
+            cosine = CosineAnnealingLR(
+                optimizer, T_max=total_epochs - args.warmup_epochs,
+            )
+            return SequentialLR(
+                optimizer, schedulers=[warmup, cosine],
+                milestones=[args.warmup_epochs],
+            )
+        else:
+            return CosineAnnealingLR(optimizer, T_max=total_epochs)
+    raise ValueError(f"Unknown lr_schedule: {args.lr_schedule}")
 
 
 # ======================================================================
@@ -67,6 +103,7 @@ def train_one_epoch(
     hq_model=None,
     expire_every=1000,
     log_every=50,
+    grad_clip_norm=0.0,
 ):
     """
     Train for one epoch with alternating generator/discriminator updates.
@@ -83,6 +120,7 @@ def train_one_epoch(
         hq_model:    Frozen HQ VQVAE (Phase C only, for association loss).
         expire_every: Run dead code expiry every N steps.
         log_every:   Print logs every N steps.
+        grad_clip_norm: Max norm for gradient clipping (0 = disabled).
 
     Returns:
         avg_logs: dict of average loss values over the epoch.
@@ -124,6 +162,11 @@ def train_one_epoch(
             z_H=z_H_flat, z_L=z_L_flat,
         )
         gen_loss.backward()
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_norm=grad_clip_norm,
+            )
         optimizer_g.step()
 
         # ----- Discriminator step -----
@@ -171,9 +214,10 @@ def train_one_epoch(
 
 def run_phase_a(args, device):
     """Phase A: Train HQ VQVAE (self-reconstruction, 50 epochs)."""
-    print("=" * 60)
-    print("Phase A: Training HQ VQVAE")
-    print("=" * 60)
+    if _is_main_process():
+        print("=" * 60)
+        print("Phase A: Training HQ VQVAE")
+        print("=" * 60)
 
     # Dataset (HQ only)
     dataset = FFHQPairedDataset(data_root=args.data_root, hq_only=True)
@@ -200,6 +244,10 @@ def run_phase_a(args, device):
     optimizer_g = torch.optim.Adam(gen_params, lr=args.lr, betas=(0.5, 0.999))
     optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
 
+    # LR schedulers
+    scheduler_g = _build_scheduler(optimizer_g, args, args.hq_epochs)
+    scheduler_d = _build_scheduler(optimizer_d, args, args.hq_epochs)
+
     # Resume
     start_epoch = 0
     ckpt_dir = os.path.join(args.ckpt_dir, "phase_a")
@@ -212,16 +260,26 @@ def run_phase_a(args, device):
         optimizer_g.load_state_dict(ckpt["optimizer_g"])
         optimizer_d.load_state_dict(ckpt["optimizer_d"])
         start_epoch = ckpt["epoch"] + 1
+        if scheduler_g and "scheduler_g" in ckpt:
+            scheduler_g.load_state_dict(ckpt["scheduler_g"])
+        if scheduler_d and "scheduler_d" in ckpt:
+            scheduler_d.load_state_dict(ckpt["scheduler_d"])
         print(f"Resumed from epoch {start_epoch}")
 
     # Training loop
+    ckpt = None
     for epoch in range(start_epoch, args.hq_epochs):
         t0 = time.time()
         avg_logs = train_one_epoch(
             model, criterion, loader, optimizer_g, optimizer_d,
             device, epoch, phase="A",
             expire_every=args.expire_every, log_every=args.log_every,
+            grad_clip_norm=args.grad_clip_norm,
         )
+        if scheduler_g:
+            scheduler_g.step()
+        if scheduler_d:
+            scheduler_d.step()
         elapsed = time.time() - t0
         print(f"Phase A | Epoch {epoch} done in {elapsed:.0f}s | "
               f"L1={avg_logs.get('l1',0):.4f} VQ={avg_logs.get('vq',0):.4f}")
@@ -234,11 +292,23 @@ def run_phase_a(args, device):
             "optimizer_g": optimizer_g.state_dict(),
             "optimizer_d": optimizer_d.state_dict(),
         }
+        if scheduler_g:
+            ckpt["scheduler_g"] = scheduler_g.state_dict()
+        if scheduler_d:
+            ckpt["scheduler_d"] = scheduler_d.state_dict()
         torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
         if (epoch + 1) % args.save_every == 0:
             torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
 
-    # Save final
+    # Save final — if loop didn't run, build ckpt from current state
+    if ckpt is None:
+        ckpt = {
+            "epoch": start_epoch - 1,
+            "model": model.state_dict(),
+            "discriminator": criterion.discriminator.state_dict(),
+            "optimizer_g": optimizer_g.state_dict(),
+            "optimizer_d": optimizer_d.state_dict(),
+        }
     torch.save(ckpt, os.path.join(ckpt_dir, "final.pt"))
     print(f"Phase A complete. Saved to {ckpt_dir}/final.pt")
 
@@ -247,9 +317,10 @@ def run_phase_a(args, device):
 
 def run_phase_b(args, device, hq_model=None):
     """Phase B: Train LQ Region-Aware VQVAE (10 epochs, λ_assoc=0)."""
-    print("=" * 60)
-    print("Phase B: Training LQ Region-Aware VQVAE")
-    print("=" * 60)
+    if _is_main_process():
+        print("=" * 60)
+        print("Phase B: Training LQ Region-Aware VQVAE")
+        print("=" * 60)
 
     # Dataset (paired HQ/LQ)
     dataset = FFHQPairedDataset(data_root=args.data_root, hq_only=False)
@@ -281,6 +352,10 @@ def run_phase_b(args, device, hq_model=None):
     optimizer_g = torch.optim.Adam(gen_params, lr=args.lr, betas=(0.5, 0.999))
     optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
 
+    # LR schedulers
+    scheduler_g = _build_scheduler(optimizer_g, args, args.lq_epochs)
+    scheduler_d = _build_scheduler(optimizer_d, args, args.lq_epochs)
+
     # Resume
     start_epoch = 0
     ckpt_dir = os.path.join(args.ckpt_dir, "phase_b")
@@ -293,16 +368,26 @@ def run_phase_b(args, device, hq_model=None):
         optimizer_g.load_state_dict(ckpt["optimizer_g"])
         optimizer_d.load_state_dict(ckpt["optimizer_d"])
         start_epoch = ckpt["epoch"] + 1
+        if scheduler_g and "scheduler_g" in ckpt:
+            scheduler_g.load_state_dict(ckpt["scheduler_g"])
+        if scheduler_d and "scheduler_d" in ckpt:
+            scheduler_d.load_state_dict(ckpt["scheduler_d"])
         print(f"Resumed from epoch {start_epoch}")
 
     # Training loop
+    ckpt = None
     for epoch in range(start_epoch, args.lq_epochs):
         t0 = time.time()
         avg_logs = train_one_epoch(
             model, criterion, loader, optimizer_g, optimizer_d,
             device, epoch, phase="B",
             expire_every=args.expire_every, log_every=args.log_every,
+            grad_clip_norm=args.grad_clip_norm,
         )
+        if scheduler_g:
+            scheduler_g.step()
+        if scheduler_d:
+            scheduler_d.step()
         elapsed = time.time() - t0
         print(f"Phase B | Epoch {epoch} done in {elapsed:.0f}s | "
               f"L1={avg_logs.get('l1',0):.4f} VQ={avg_logs.get('vq',0):.4f}")
@@ -314,10 +399,22 @@ def run_phase_b(args, device, hq_model=None):
             "optimizer_g": optimizer_g.state_dict(),
             "optimizer_d": optimizer_d.state_dict(),
         }
+        if scheduler_g:
+            ckpt["scheduler_g"] = scheduler_g.state_dict()
+        if scheduler_d:
+            ckpt["scheduler_d"] = scheduler_d.state_dict()
         torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
         if (epoch + 1) % args.save_every == 0:
             torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
 
+    if ckpt is None:
+        ckpt = {
+            "epoch": start_epoch - 1,
+            "model": model.state_dict(),
+            "discriminator": criterion.discriminator.state_dict(),
+            "optimizer_g": optimizer_g.state_dict(),
+            "optimizer_d": optimizer_d.state_dict(),
+        }
     torch.save(ckpt, os.path.join(ckpt_dir, "final.pt"))
     print(f"Phase B complete. Saved to {ckpt_dir}/final.pt")
 
@@ -326,9 +423,10 @@ def run_phase_b(args, device, hq_model=None):
 
 def run_phase_c(args, device, hq_model=None, lq_model=None):
     """Phase C: Continue LQ training with association loss (10 epochs, λ_assoc=1)."""
-    print("=" * 60)
-    print("Phase C: LQ VQVAE + Association Loss")
-    print("=" * 60)
+    if _is_main_process():
+        print("=" * 60)
+        print("Phase C: LQ VQVAE + Association Loss")
+        print("=" * 60)
 
     # Load HQ model (frozen)
     if hq_model is None:
@@ -338,8 +436,8 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
         hq_model = build_hq_vqvae(
             n_codes=args.hq_n_codes, embed_dim=args.embed_dim,
         ).to(device)
-        ckpt = torch.load(args.hq_ckpt, map_location=device, weights_only=False)
-        hq_model.load_state_dict(ckpt["model"])
+        hq_ckpt = torch.load(args.hq_ckpt, map_location=device, weights_only=False)
+        hq_model.load_state_dict(hq_ckpt["model"])
 
     hq_model.eval()
     for p in hq_model.parameters():
@@ -357,8 +455,8 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
             parser_ckpt=args.parser_ckpt,
         ).to(device)
         lq_model = build_lq_vqvae(ravq, embed_dim=args.embed_dim).to(device)
-        ckpt = torch.load(args.lq_ckpt, map_location=device, weights_only=False)
-        lq_model.load_state_dict(ckpt["model"])
+        lq_ckpt = torch.load(args.lq_ckpt, map_location=device, weights_only=False)
+        lq_model.load_state_dict(lq_ckpt["model"])
 
     model = lq_model
 
@@ -371,16 +469,28 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
     print(f"Dataset: {len(dataset)} HQ/LQ pairs, {len(loader)} batches/epoch")
 
     # Losses (association enabled)
+    # By default, discriminator is freshly initialized so it doesn't resist
+    # the association-loss-driven changes the generator needs to make.
     criterion = Stage1VQLoss(
         lambda_per=args.lambda_per, lambda_dis=args.lambda_dis,
         lambda_assoc=args.lambda_assoc,
         vgg_pretrained=True,
     ).to(device)
 
+    # Optionally load Phase B's discriminator for continuity
+    if args.phase_c_load_disc and args.lq_ckpt:
+        disc_ckpt = torch.load(args.lq_ckpt, map_location=device, weights_only=False)
+        criterion.discriminator.load_state_dict(disc_ckpt["discriminator"])
+        print("Loaded Phase B discriminator into Phase C.")
+
     # Optimizers
     gen_params = [p for p in model.parameters() if p.requires_grad]
     optimizer_g = torch.optim.Adam(gen_params, lr=args.lr, betas=(0.5, 0.999))
     optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
+
+    # LR schedulers
+    scheduler_g = _build_scheduler(optimizer_g, args, args.assoc_epochs)
+    scheduler_d = _build_scheduler(optimizer_d, args, args.assoc_epochs)
 
     # Resume
     start_epoch = 0
@@ -394,16 +504,26 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
         optimizer_g.load_state_dict(ckpt["optimizer_g"])
         optimizer_d.load_state_dict(ckpt["optimizer_d"])
         start_epoch = ckpt["epoch"] + 1
+        if scheduler_g and "scheduler_g" in ckpt:
+            scheduler_g.load_state_dict(ckpt["scheduler_g"])
+        if scheduler_d and "scheduler_d" in ckpt:
+            scheduler_d.load_state_dict(ckpt["scheduler_d"])
         print(f"Resumed from epoch {start_epoch}")
 
     # Training loop
+    ckpt = None
     for epoch in range(start_epoch, args.assoc_epochs):
         t0 = time.time()
         avg_logs = train_one_epoch(
             model, criterion, loader, optimizer_g, optimizer_d,
             device, epoch, phase="C", hq_model=hq_model,
             expire_every=args.expire_every, log_every=args.log_every,
+            grad_clip_norm=args.grad_clip_norm,
         )
+        if scheduler_g:
+            scheduler_g.step()
+        if scheduler_d:
+            scheduler_d.step()
         elapsed = time.time() - t0
         print(f"Phase C | Epoch {epoch} done in {elapsed:.0f}s | "
               f"L1={avg_logs.get('l1',0):.4f} VQ={avg_logs.get('vq',0):.4f} "
@@ -416,10 +536,22 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
             "optimizer_g": optimizer_g.state_dict(),
             "optimizer_d": optimizer_d.state_dict(),
         }
+        if scheduler_g:
+            ckpt["scheduler_g"] = scheduler_g.state_dict()
+        if scheduler_d:
+            ckpt["scheduler_d"] = scheduler_d.state_dict()
         torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
         if (epoch + 1) % args.save_every == 0:
             torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
 
+    if ckpt is None:
+        ckpt = {
+            "epoch": start_epoch - 1,
+            "model": model.state_dict(),
+            "discriminator": criterion.discriminator.state_dict(),
+            "optimizer_g": optimizer_g.state_dict(),
+            "optimizer_d": optimizer_d.state_dict(),
+        }
     torch.save(ckpt, os.path.join(ckpt_dir, "final.pt"))
     print(f"Phase C complete. Saved to {ckpt_dir}/final.pt")
 
@@ -433,13 +565,17 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
 def parse_args():
     parser = argparse.ArgumentParser(description="CRAFT Stage 1 Training")
 
+    # Config file (YAML values are used as defaults; CLI flags override them)
+    parser.add_argument("--config", type=str, default="",
+                        help="Path to YAML config file (e.g. configs/train.yaml)")
+
     # Phase selection
     parser.add_argument("--phase", type=str, default="all",
                         choices=["A", "B", "C", "all"],
                         help="Training phase: A (HQ), B (LQ), C (assoc), or all")
 
     # Data
-    parser.add_argument("--data_root", type=str, default= "/projectnb/cs585/projects/craft/data/train", required=True,
+    parser.add_argument("--data_root", type=str, default="/projectnb/cs585/projects/craft/data/train",
                         help="Path to train/ directory with images512x512/ and LQ_images_512x512/")
     parser.add_argument("--num_workers", type=int, default=4)
 
@@ -457,6 +593,13 @@ def parse_args():
     # Training hyperparameters
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1.44e-4)
+    parser.add_argument("--lr_schedule", type=str, default="none",
+                        choices=["none", "cosine"],
+                        help="LR schedule: none (constant) or cosine decay")
+    parser.add_argument("--warmup_epochs", type=int, default=0,
+                        help="Linear warmup epochs before cosine decay (0 = no warmup)")
+    parser.add_argument("--grad_clip_norm", type=float, default=0.0,
+                        help="Max gradient norm for clipping (0 = disabled)")
     parser.add_argument("--hq_epochs", type=int, default=50, help="Phase A epochs")
     parser.add_argument("--lq_epochs", type=int, default=10, help="Phase B epochs")
     parser.add_argument("--assoc_epochs", type=int, default=10, help="Phase C epochs")
@@ -475,6 +618,8 @@ def parse_args():
                         help="Phase B checkpoint (for Phase C)")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore existing checkpoints and start fresh")
+    parser.add_argument("--phase_c_load_disc", action="store_true",
+                        help="Load Phase B discriminator in Phase C instead of fresh init")
     parser.add_argument("--save_every", type=int, default=5,
                         help="Save checkpoint every N epochs")
 
@@ -484,6 +629,14 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=50,
                         help="Print logs every N steps")
     parser.add_argument("--device", type=str, default="cuda")
+
+    # First parse to get --config path, then re-parse with YAML defaults
+    args, remaining = parser.parse_known_args()
+    if args.config:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+        # Set YAML values as new defaults (CLI flags still override)
+        parser.set_defaults(**cfg)
 
     return parser.parse_args()
 

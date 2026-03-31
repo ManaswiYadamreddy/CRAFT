@@ -4,9 +4,9 @@ test_pipeline.py — Pre-flight check for CRAFT Stage 1 training.
 Run BEFORE starting actual training to verify everything works.
 
 Usage:
-    python test_pipeline.py --data_root /projectnb/cs585/projects/craft/data/train
+    python test_pipeline.py --config configs/test.yaml
+    python test_pipeline.py --config configs/test.yaml --skip_fullres
     python test_pipeline.py --data_root data/train --parser_ckpt pretrained/79999_iter.pth
-    python test_pipeline.py --data_root data/train --skip_fullres
 """
 
 import argparse
@@ -16,6 +16,8 @@ import shutil
 import sys
 import tempfile
 import traceback
+
+import yaml
 
 import torch
 import numpy as np
@@ -324,10 +326,20 @@ def run_tests(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default = "/projectnb/cs585/projects/craft/data/train",type=str, required=True)
+    p.add_argument("--config", type=str, default="",
+                   help="Path to YAML config file (e.g. configs/test.yaml)")
+    p.add_argument("--data_root", default="/projectnb/cs585/projects/craft/data/train", type=str,
+                   help="Path to train/ directory with images512x512/ and LQ_images_512x512/")
     p.add_argument("--parser_ckpt", type=str, default="/projectnb/cs585/projects/craft/pretrained/79999_iter.pth")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--skip_fullres", action="store_true")
+
+    args, _ = p.parse_known_args()
+    if args.config:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+        p.set_defaults(**cfg)
+
     sys.exit(0 if run_tests(p.parse_args()) else 1)
 
 

@@ -212,10 +212,6 @@ def train_one_epoch(
                       f"(total NaN steps: {nan_steps})")
             optimizer_g.zero_grad()
             optimizer_d.zero_grad()
-            if scaler_g is not None:
-                scaler_g.update()
-            if scaler_d is not None:
-                scaler_d.update()
             continue
 
         if scaler_g is not None:

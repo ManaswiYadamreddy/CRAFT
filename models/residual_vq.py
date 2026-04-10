@@ -155,54 +155,52 @@ class VQLevel(nn.Module):
     def forward(self, z_flat):
         """
         Quantize input features.
-        
+
         Args:
             z_flat: (N, e_dim) flattened feature vectors.
-                    N = number of spatial positions belonging to one region 
+                    N = number of spatial positions belonging to one region
                     across the entire batch.
-        
+
         Returns:
             z_q:     (N, e_dim) quantized vectors with straight-through gradient.
             indices: (N,) integer codebook indices.
             losses:  dict with 'commitment' and 'entropy' scalar losses.
             info:    dict with monitoring metrics (perplexity, usage ratio).
         """
+        # Force float32 for VQ ops to prevent overflow under AMP
+        z_flat_f32 = z_flat.float()
+        embed_f32 = self.embedding.weight.float()
+
         # Initialize codebook from data on first forward pass
         if self.training and not self.inited:
-            self._init_codebook(z_flat)
+            self._init_codebook(z_flat_f32)
 
-        # --- Distance computation ---
+        # --- Distance computation (in float32) ---
         # ||z - e||^2 = ||z||^2 + ||e||^2 - 2 z·e^T
         d = (
-            z_flat.pow(2).sum(dim=1, keepdim=True)
-            + self.embedding.weight.pow(2).sum(dim=1)
-            - 2.0 * z_flat @ self.embedding.weight.t()
+            z_flat_f32.pow(2).sum(dim=1, keepdim=True)
+            + embed_f32.pow(2).sum(dim=1)
+            - 2.0 * z_flat_f32 @ embed_f32.t()
         )  # (N, n_codes)
 
         # --- Hard assignment ---
         indices = d.argmin(dim=-1)  # (N,)
         z_q = self.embedding(indices)  # (N, e_dim)
 
-        # --- Losses ---
-        # Commitment loss: pushes encoder output toward codebook entries
-        # (codebook itself is updated via EMA, not gradients)
-        commitment_loss = self.beta * F.mse_loss(z_flat, z_q.detach())
+        # --- Losses (in float32) ---
+        commitment_loss = self.beta * F.mse_loss(z_flat_f32, z_q.float().detach())
 
         # Entropy regularization (HQ-VAE style collapse prevention)
-        # Compute empirical distribution of code assignments
         avg_probs = F.one_hot(indices, self.n_codes).float().mean(dim=0)  # (n_codes,)
-        # Entropy of this distribution (higher = more uniform = healthier)
         avg_entropy = -(avg_probs * (avg_probs + 1e-10).log()).sum()
         max_entropy = math.log(self.n_codes)
-        # Entropy loss: minimize (max_entropy - actual_entropy)
         entropy_loss = max_entropy - avg_entropy
 
-        # --- EMA codebook update ---
+        # --- EMA codebook update (in float32) ---
         if self.training:
-            self._ema_update(z_flat, indices)
+            self._ema_update(z_flat_f32, indices)
 
-        # --- Straight-through estimator ---
-        # Forward: use z_q (discrete). Backward: gradient flows through z_flat.
+        # --- Straight-through estimator (in original dtype) ---
         z_q_st = z_flat + (z_q - z_flat).detach()
 
         # --- Monitoring info ---

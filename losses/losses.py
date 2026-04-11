@@ -28,6 +28,8 @@ Loss weights from OSDFace (Eq. 8, 11):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.amp
+from torch.nn.utils import spectral_norm
 import torchvision
 
 
@@ -130,6 +132,10 @@ class VGGPerceptualLoss(nn.Module):
             features.append(x)
         return features
 
+    # fp16 safe range: clamp activations to prevent overflow in deep VGG layers
+    # while keeping memory-efficient fp16 forward pass
+    _FP16_MAX = 65000.0
+
     def forward(self, pred, target):
         """
         Args:
@@ -138,21 +144,26 @@ class VGGPerceptualLoss(nn.Module):
         Returns:
             Scalar perceptual loss (weighted sum of per-layer L2 distances).
         """
-        # We need gradients for pred features (backprop to generator)
-        # but not for target features
+        # VGG forward stays in fp16 (under autocast) to save memory.
+        # Deep layers (relu4_1, relu5_1) can overflow fp16 max (65504),
+        # so we clamp activations after each block. MSE is computed in
+        # fp32 to prevent gradient overflow.
         pred_normalized = self._normalize(pred)
         with torch.no_grad():
             target_normalized = self._normalize(target)
 
-        loss = 0.0
+        loss = torch.zeros(1, device=pred.device, dtype=torch.float32)
         x_pred = pred_normalized
         x_target = target_normalized
 
         for i, block in enumerate(self.blocks):
             x_pred = block(x_pred)
+            x_pred = x_pred.clamp(-self._FP16_MAX, self._FP16_MAX)
             with torch.no_grad():
                 x_target = block(x_target)
-            loss = loss + self.layer_weights[i] * F.mse_loss(x_pred, x_target)
+                x_target = x_target.clamp(-self._FP16_MAX, self._FP16_MAX)
+            # Cast to fp32 for MSE to prevent overflow in loss/grads
+            loss = loss + self.layer_weights[i] * F.mse_loss(x_pred.float(), x_target.float())
 
         return loss
 
@@ -182,7 +193,7 @@ class PatchDiscriminator(nn.Module):
         super().__init__()
 
         layers = [
-            nn.Conv2d(in_channels, ndf, kernel_size=4, stride=2, padding=1),
+            spectral_norm(nn.Conv2d(in_channels, ndf, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
         ]
 
@@ -191,22 +202,20 @@ class PatchDiscriminator(nn.Module):
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
             layers += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=4, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(ndf * nf_mult),
+                spectral_norm(nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=4, stride=2, padding=1, bias=False)),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
 
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
         layers += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=4, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * nf_mult),
+            spectral_norm(nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=4, stride=1, padding=1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
         ]
 
         # Final 1-channel output (real/fake prediction per patch)
         layers += [
-            nn.Conv2d(ndf * nf_mult, 1, kernel_size=4, stride=1, padding=1),
+            spectral_norm(nn.Conv2d(ndf * nf_mult, 1, kernel_size=4, stride=1, padding=1)),
         ]
 
         self.model = nn.Sequential(*layers)
@@ -393,11 +402,16 @@ class Stage1VQLoss(nn.Module):
         # Reconstruction
         l1 = self.l1_loss(pred, target)
 
-        # Perceptual
+        # Perceptual — soft-cap to dampen single-batch spikes while
+        # preserving gradients (hard clamp kills gradients at the cap)
         l_per = self.perceptual_loss(pred, target)
+        per_cap = 200.0
+        l_per = per_cap * torch.tanh(l_per / per_cap)
 
         # Adversarial (generator wants discriminator to say "real")
         l_gan_g = gan_g_loss(self.discriminator, pred)
+        gan_cap = 50.0
+        l_gan_g = gan_cap * torch.tanh(l_gan_g / gan_cap)
 
         # Start with base losses
         total = l1 + self.lambda_per * l_per + self.lambda_dis * l_gan_g + vq_loss

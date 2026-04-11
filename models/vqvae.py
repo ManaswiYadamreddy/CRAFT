@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.utils.checkpoint import checkpoint
 
 
 # ======================================================================
@@ -151,7 +152,9 @@ class MultiHeadAttnBlock(nn.Module):
         k = k.transpose(1, 2).transpose(2, 3)
 
         scale = int(self.att_size) ** (-0.5)
-        w_ = F.softmax(q.mul(scale) @ k, dim=3)
+        # Compute attention in float32 to prevent overflow under AMP
+        q_f32, k_f32 = q.float(), k.float()
+        w_ = F.softmax(q_f32.mul(scale) @ k_f32, dim=3).to(v.dtype)
         atten_weight = w_.detach().clone()
 
         out = (w_ @ v).transpose(1, 2).contiguous().view(b, h, w, -1).permute(0, 3, 1, 2)
@@ -228,16 +231,17 @@ class MultiHeadEncoder(nn.Module):
             block_in, 2 * z_channels if double_z else z_channels,
             kernel_size=3, stride=1, padding=1,
         )
+        self._use_gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        self._use_gradient_checkpointing = True
+
+    def _ckpt(self, fn, *args):
+        if self._use_gradient_checkpointing and self.training:
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, 3, 512, 512) input image.
-        Returns:
-            hs:   dict of intermediate features (for skip connections if needed).
-                  hs['out'] is the final feature map (B, z_channels, 16, 16).
-            atten_weight: attention weights from the mid block.
-        """
         hs = {}
         temb = None
         h = self.conv_in(x)
@@ -245,7 +249,7 @@ class MultiHeadEncoder(nn.Module):
 
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](h, temb)
+                h = self._ckpt(self.down[i_level].block[i_block], h, temb)
                 if len(self.down[i_level].attn) > 0:
                     h, _ = self.down[i_level].attn[i_block](h)
             if i_level != self.num_resolutions - 1:
@@ -254,10 +258,10 @@ class MultiHeadEncoder(nn.Module):
 
         atten_weight = None
         if self.enable_mid:
-            h = self.mid.block_1(h, temb)
+            h = self._ckpt(self.mid.block_1, h, temb)
             hs[f"block_{i_level}_atten"] = h
             h, atten_weight = self.mid.attn_1(h)
-            h = self.mid.block_2(h, temb)
+            h = self._ckpt(self.mid.block_2, h, temb)
             hs["mid_atten"] = h
 
         h = nonlinearity(self.norm_out(h))
@@ -330,27 +334,30 @@ class MultiHeadDecoder(nn.Module):
 
         self.norm_out = Normalize(block_in)
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
+        self._use_gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        self._use_gradient_checkpointing = True
+
+    def _ckpt(self, fn, *args):
+        if self._use_gradient_checkpointing and self.training:
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
 
     def forward(self, z):
-        """
-        Args:
-            z: (B, z_channels, 16, 16) quantized feature map.
-        Returns:
-            (B, 3, 512, 512) reconstructed image.
-        """
         temb = None
         h = self.conv_in(z)
 
         if self.enable_mid:
-            h = self.mid.block_1(h, temb)
-            h, _ = self.mid.attn_1(h)  # unpack attention weights
-            h = self.mid.block_2(h, temb)
+            h = self._ckpt(self.mid.block_1, h, temb)
+            h, _ = self.mid.attn_1(h)
+            h = self._ckpt(self.mid.block_2, h, temb)
 
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
-                h = self.up[i_level].block[i_block](h, temb)
+                h = self._ckpt(self.up[i_level].block[i_block], h, temb)
                 if len(self.up[i_level].attn) > 0:
-                    h, _ = self.up[i_level].attn[i_block](h)  # unpack attention weights
+                    h, _ = self.up[i_level].attn[i_block](h)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
@@ -381,7 +388,7 @@ class GlobalVQ(nn.Module):
         entropy_weight: Entropy regularization weight (default: 0.1).
     """
 
-    def __init__(self, n_codes=1024, e_dim=512, beta=0.25, ema_decay=0.99,
+    def __init__(self, n_codes=1024, e_dim=512, beta=0.25, ema_decay=0.95,
                  entropy_weight=0.1):
         super().__init__()
         self.n_codes = n_codes
@@ -427,12 +434,12 @@ class GlobalVQ(nn.Module):
     def forward(self, z, images=None, masks=None):
         """
         Quantize feature map using a flat codebook.
-        
+
         Args:
             z:      (B, C, H, W) encoder feature map.
             images: Unused (present for interface compatibility with RegionAwareVQ).
             masks:  Unused.
-        
+
         Returns:
             z_q:        (B, C, H, W) quantized feature map with straight-through gradient.
             all_losses: dict with 'commitment', 'entropy', 'total_vq'.
@@ -443,23 +450,30 @@ class GlobalVQ(nn.Module):
         # (B, C, H, W) → (B*H*W, C)
         z_flat = z.permute(0, 2, 3, 1).reshape(-1, C)
 
+        # Force float32 for VQ ops to prevent overflow under AMP
+        z_flat_f32 = z_flat.float()
+        embed_f32 = self.embedding.weight.float()
+
         # Data-driven init
         if self.training and not self.inited:
-            self._init_codebook(z_flat)
+            self._init_codebook(z_flat_f32)
 
-        # Distance computation
+        # Distance computation (in float32 to avoid overflow with 512-dim vectors)
         d = (
-            z_flat.pow(2).sum(1, keepdim=True)
-            + self.embedding.weight.pow(2).sum(1)
-            - 2.0 * z_flat @ self.embedding.weight.t()
+            z_flat_f32.pow(2).sum(1, keepdim=True)
+            + embed_f32.pow(2).sum(1)
+            - 2.0 * z_flat_f32 @ embed_f32.t()
         )
 
         # Hard assignment
         indices = d.argmin(dim=-1)
         z_q_flat = self.embedding(indices)
 
-        # Commitment loss
-        commitment_loss = self.beta * F.mse_loss(z_flat, z_q_flat.detach())
+        # Commitment loss (in float32), soft-clamped to prevent runaway growth
+        # while preserving gradients (hard clamp kills gradients at the cap)
+        commitment_loss = self.beta * F.mse_loss(z_flat_f32, z_q_flat.float().detach())
+        soft_cap = 10.0
+        commitment_loss = soft_cap * torch.tanh(commitment_loss / soft_cap)
 
         # Entropy regularization
         avg_probs = F.one_hot(indices, self.n_codes).float().mean(0)
@@ -467,11 +481,11 @@ class GlobalVQ(nn.Module):
         max_entropy = math.log(self.n_codes)
         entropy_loss = (max_entropy - avg_entropy) * self.entropy_weight
 
-        # EMA update
+        # EMA update (in float32)
         if self.training:
-            self._ema_update(z_flat, indices)
+            self._ema_update(z_flat_f32, indices)
 
-        # Straight-through
+        # Straight-through (in original dtype for downstream compatibility)
         z_q_flat = z_flat + (z_q_flat - z_flat).detach()
 
         # Reshape back
@@ -485,6 +499,8 @@ class GlobalVQ(nn.Module):
         all_info = {
             "perplexity": torch.exp(avg_entropy).detach(),
             "codebook_usage": (avg_probs > 0).float().sum().detach() / self.n_codes,
+            "z_norm": z_flat_f32.detach().norm(dim=-1).mean(),
+            "codebook_norm": embed_f32.detach().norm(dim=-1).mean(),
         }
 
         return z_q, all_losses, all_info
@@ -585,16 +601,18 @@ class VQVAE(nn.Module):
         h = self.post_quant_conv(z_q)
         return self.decoder(h)
 
-    def forward(self, x, images_01=None):
+    def forward(self, x, images_01=None, masks=None):
         """
         Full forward: encode → quantize → decode.
-        
+
         Args:
             x:          (B, 3, 512, 512) input image in [-1, 1] (goes through encoder).
-            images_01:  (B, 3, 512, 512) same image in [0, 1] (for face parser in 
-                        RegionAwareVQ). Only needed when quantizer is RegionAwareVQ.
-                        Ignored for GlobalVQ.
-        
+            images_01:  (B, 3, 512, 512) same image in [0, 1] (for face parser in
+                        RegionAwareVQ). Only needed when quantizer is RegionAwareVQ
+                        and masks is not provided.
+            masks:      Optional pre-computed region masks dict. If provided, the face
+                        parser is skipped entirely. Keys: region names, values: (B, H, W) bool.
+
         Returns:
             x_rec:      (B, 3, 512, 512) reconstructed image.
             z:          (B, embed_dim, 16, 16) pre-quantization features (for association loss).
@@ -607,7 +625,7 @@ class VQVAE(nn.Module):
 
         # Quantize
         if self.quantizer is not None:
-            z_q, vq_losses, vq_info = self.quantizer(z, images=images_01)
+            z_q, vq_losses, vq_info = self.quantizer(z, images=images_01, masks=masks)
         else:
             z_q = z
             vq_losses = {"commitment": 0.0, "entropy": 0.0, "total_vq": 0.0}

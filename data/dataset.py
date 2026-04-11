@@ -29,21 +29,25 @@ from torchvision import transforms
 class FFHQPairedDataset(Dataset):
     """
     Paired HQ/LQ dataset for CRAFT Stage 1 training.
-    
+
     Each sample returns a dict with:
         'hq':       (3, 512, 512) HQ image tensor in [-1, 1]
         'lq':       (3, 512, 512) LQ image tensor in [-1, 1]
         'hq_01':    (3, 512, 512) HQ image tensor in [0, 1] (for face parser)
         'lq_01':    (3, 512, 512) LQ image tensor in [0, 1] (for face parser)
         'filename': str, e.g. '00000'
-    
+        'hq_mask':  (16, 16) int64 region indices (if masks_folder exists)
+        'lq_mask':  (16, 16) int64 region indices (if masks_folder exists)
+
     Args:
-        data_root:   Path to 'train/' directory containing the image folders.
-        hq_folder:   Name of HQ image subfolder (default: 'images512x512').
-        lq_folder:   Name of LQ image subfolder (default: 'LQ_images_512x512').
-        resolution:  Target resolution (default: 512).
-        hq_only:     If True, only load HQ images (for HQ VQVAE pre-training).
-                     'lq' and 'lq_01' will be None.
+        data_root:     Path to 'train/' directory containing the image folders.
+        hq_folder:     Name of HQ image subfolder (default: 'images512x512').
+        lq_folder:     Name of LQ image subfolder (default: 'LQ_images_512x512').
+        masks_folder:  Name of pre-computed masks subfolder (default: 'masks_16x16').
+                       Set to "" to disable loading masks.
+        resolution:    Target resolution (default: 512).
+        hq_only:       If True, only load HQ images (for HQ VQVAE pre-training).
+                       'lq' and 'lq_01' will be None.
     """
 
     def __init__(
@@ -51,6 +55,7 @@ class FFHQPairedDataset(Dataset):
         data_root,
         hq_folder="images512x512",
         lq_folder="LQ_images_512x512",
+        masks_folder="masks_16x16",
         resolution=512,
         hq_only=False,
     ):
@@ -60,6 +65,13 @@ class FFHQPairedDataset(Dataset):
         self.lq_dir = os.path.join(data_root, lq_folder)
         self.resolution = resolution
         self.hq_only = hq_only
+
+        # Check for pre-computed masks
+        self.masks_dir = None
+        if masks_folder:
+            masks_path = os.path.join(data_root, masks_folder)
+            if os.path.isdir(masks_path):
+                self.masks_dir = masks_path
 
         # Discover HQ images
         hq_paths = sorted(glob.glob(os.path.join(self.hq_dir, "*.png")))
@@ -88,7 +100,7 @@ class FFHQPairedDataset(Dataset):
 
         # Transforms
         self.to_tensor = transforms.ToTensor()  # PIL → [0, 1] tensor
-        self.resize = transforms.Resize(
+        self._resize = transforms.Resize(
             (resolution, resolution),
             interpolation=transforms.InterpolationMode.BICUBIC,
             antialias=True,
@@ -102,7 +114,9 @@ class FFHQPairedDataset(Dataset):
 
         # Load HQ
         hq_img = Image.open(hq_path).convert("RGB")
-        hq_01 = self.resize(self.to_tensor(hq_img))  # (3, 512, 512) in [0, 1]
+        hq_01 = self.to_tensor(hq_img)  # (3, H, W) in [0, 1]
+        if hq_01.shape[1] != self.resolution or hq_01.shape[2] != self.resolution:
+            hq_01 = self._resize(hq_01)
         hq = hq_01 * 2.0 - 1.0  # [-1, 1]
 
         output = {
@@ -111,12 +125,25 @@ class FFHQPairedDataset(Dataset):
             "filename": stem,
         }
 
+        # Load pre-computed masks if available
+        if self.masks_dir is not None:
+            hq_mask_path = os.path.join(self.masks_dir, f"{stem}_hq.pt")
+            if os.path.exists(hq_mask_path):
+                output["hq_mask"] = torch.load(hq_mask_path, weights_only=True)
+
         # Load LQ
         if not self.hq_only:
             lq_img = Image.open(lq_path).convert("RGB")
-            lq_01 = self.resize(self.to_tensor(lq_img))
+            lq_01 = self.to_tensor(lq_img)
+            if lq_01.shape[1] != self.resolution or lq_01.shape[2] != self.resolution:
+                lq_01 = self._resize(lq_01)
             lq = lq_01 * 2.0 - 1.0
             output["lq"] = lq
             output["lq_01"] = lq_01
+
+            if self.masks_dir is not None:
+                lq_mask_path = os.path.join(self.masks_dir, f"{stem}_lq.pt")
+                if os.path.exists(lq_mask_path):
+                    output["lq_mask"] = torch.load(lq_mask_path, weights_only=True)
 
         return output

@@ -1,0 +1,51 @@
+# CRAFT Stage 1 — Training configuration
+# Usage: python train_stage1.py --config configs/train.yaml [--phase A]
+
+# Phase selection: A, B, C, or all
+phase: all
+
+# Data
+data_root: /projectnb/cs585/projects/craft/data/train
+num_workers: 4
+
+# Architecture
+embed_dim: 512
+hq_n_codes: 1024
+rq_levels: 3
+
+# Face parser
+parser_ckpt: /projectnb/cs585/projects/craft/pretrained/79999_iter.pth
+
+# Training hyperparameters
+batch_size: 32
+lr: 1.44e-4
+lr_schedule: cosine      # none | cosine
+warmup_epochs: 2         # linear warmup epochs before cosine decay
+grad_clip_norm: 1.0      # max gradient norm (prevents NaN from GAN loss spikes)
+hq_epochs: 50            # Phase A
+lq_epochs: 10            # Phase B
+assoc_epochs: 10         # Phase C
+
+# Loss weights
+lambda_per: 1.0
+lambda_dis: 0.8
+lambda_assoc: 1.0
+gan_warmup_epochs: 2     # ramp lambda_dis from 0 to 0.8 over first 2 epochs
+
+# Checkpointing
+ckpt_dir: checkpoints
+hq_ckpt: ""
+lq_ckpt: ""
+fresh: false
+phase_c_load_disc: false
+save_every: 5
+
+# Memory optimization
+amp: true                # mixed precision (AMP) — ~2x memory savings
+grad_ckpt: true          # gradient checkpointing — trades compute for memory
+grad_accum_steps: 4      # gradient accumulation (effective batch = batch_size * 4)
+
+# Misc
+expire_every: 1000
+log_every: 50
+device: cuda

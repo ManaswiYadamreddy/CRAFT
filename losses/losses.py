@@ -138,26 +138,23 @@ class VGGPerceptualLoss(nn.Module):
         Returns:
             Scalar perceptual loss (weighted sum of per-layer L2 distances).
         """
-        # Run VGG in fp32 to avoid fp16 overflow in deep feature layers.
-        # Autocast is disabled here because VGG activations at relu4/relu5
-        # easily exceed fp16 range (~65504), causing inf/NaN gradients.
-        with torch.amp.autocast("cuda", enabled=False):
-            pred_f32 = pred.float()
-            target_f32 = target.float()
+        # VGG forward stays in fp16 (under autocast) to save memory.
+        # Only the per-layer MSE is computed in fp32 to avoid overflow
+        # when gradients are scaled by GradScaler.
+        pred_normalized = self._normalize(pred)
+        with torch.no_grad():
+            target_normalized = self._normalize(target)
 
-            pred_normalized = self._normalize(pred_f32)
+        loss = torch.zeros(1, device=pred.device, dtype=torch.float32)
+        x_pred = pred_normalized
+        x_target = target_normalized
+
+        for i, block in enumerate(self.blocks):
+            x_pred = block(x_pred)
             with torch.no_grad():
-                target_normalized = self._normalize(target_f32)
-
-            loss = 0.0
-            x_pred = pred_normalized
-            x_target = target_normalized
-
-            for i, block in enumerate(self.blocks):
-                x_pred = block(x_pred)
-                with torch.no_grad():
-                    x_target = block(x_target)
-                loss = loss + self.layer_weights[i] * F.mse_loss(x_pred, x_target)
+                x_target = block(x_target)
+            # Cast to fp32 only for the MSE to prevent overflow in loss/grads
+            loss = loss + self.layer_weights[i] * F.mse_loss(x_pred.float(), x_target.float())
 
         return loss
 

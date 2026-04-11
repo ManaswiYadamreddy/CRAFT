@@ -164,15 +164,19 @@ def train_one_epoch(
     nan_steps = 0
 
     for step, batch in enumerate(loader):
+        # ----- Move entire batch to device once -----
+        batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+                 for k, v in batch.items()}
+
         # ----- Prepare inputs -----
         if phase == "A":
-            x = batch["hq"].to(device)
-            x_01 = batch["hq_01"].to(device)
+            x = batch["hq"]
+            x_01 = batch["hq_01"]
             target = x
             masks = None  # GlobalVQ doesn't use masks
         else:
-            x = batch["lq"].to(device)
-            x_01 = batch["lq_01"].to(device)
+            x = batch["lq"]
+            x_01 = batch["lq_01"]
             target = x
             # Use pre-computed masks if available
             if "lq_mask" in batch:
@@ -181,22 +185,23 @@ def train_one_epoch(
                 masks = None
 
         is_accum_step = (step + 1) % grad_accum_steps != 0
+        is_first_accum = step % grad_accum_steps == 0
         loss_scale = 1.0 / grad_accum_steps
 
         # ----- Generator step -----
-        if not is_accum_step or step == 0:
+        if is_first_accum:
             optimizer_g.zero_grad()
 
         with autocast("cuda", enabled=use_amp):
             x_rec, z, z_q, vq_losses, vq_info = model(x, images_01=x_01, masks=masks)
 
-            # Association features (Phase C only)
+            # Association features (Phase C only, both in fp32)
             z_H_flat, z_L_flat = None, None
             if phase == "C" and hq_model is not None:
                 with torch.no_grad():
-                    z_H_flat = hq_model.get_features_flat(batch["hq"].to(device))
+                    z_H_flat = hq_model.get_features_flat(batch["hq"]).float()
                 B, C, H, W = z.shape
-                z_L_flat = z.permute(0, 2, 3, 1).reshape(B, H * W, C)
+                z_L_flat = z.float().permute(0, 2, 3, 1).reshape(B, H * W, C)
 
             gen_loss, gen_logs = criterion.generator_loss(
                 x_rec, target, vq_losses["total_vq"],
@@ -204,13 +209,18 @@ def train_one_epoch(
             )
             gen_loss = gen_loss * loss_scale
 
-        # NaN/Inf safety net — should be rare with fp32 perceptual loss
+        # NaN/Inf safety net
         if torch.isnan(gen_loss) or torch.isinf(gen_loss):
             nan_steps += 1
             print(f"  [Step {step+1}] NaN/Inf in gen_loss (total: {nan_steps}), "
                   f"skipping entire step")
             optimizer_g.zero_grad()
             optimizer_d.zero_grad()
+            # Reset GradScaler to low scale to prevent repeated overflow
+            if scaler_g is not None:
+                scaler_g._scale = torch.tensor(2**10, dtype=torch.float32, device=device)
+            if scaler_d is not None:
+                scaler_d._scale = torch.tensor(2**10, dtype=torch.float32, device=device)
             del gen_loss, gen_logs, x_rec, z, z_q, vq_losses, vq_info
             del z_H_flat, z_L_flat
             torch.cuda.empty_cache()
@@ -225,30 +235,39 @@ def train_one_epoch(
             if grad_clip_norm > 0:
                 if scaler_g is not None:
                     scaler_g.unscale_(optimizer_g)
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     max_norm=grad_clip_norm,
                 )
+                accum.setdefault("grad_norm_sum", 0.0)
+                accum.setdefault("grad_norm_count", 0)
+                gn = grad_norm.item()
+                if not (math.isnan(gn) or math.isinf(gn)):
+                    accum["grad_norm_sum"] += gn
+                    accum["grad_norm_count"] += 1
             if scaler_g is not None:
                 scaler_g.step(optimizer_g)
                 scaler_g.update()
             else:
                 optimizer_g.step()
 
-        # ----- Discriminator step -----
-        if not is_accum_step or step == 0:
+        # ----- Discriminator step (every accumulation boundary, not accumulated) -----
+        if not is_accum_step:
             optimizer_d.zero_grad()
 
-        with autocast("cuda", enabled=use_amp):
-            d_loss, d_logs = criterion.discriminator_loss(target, x_rec.detach())
-            d_loss = d_loss * loss_scale
+            with autocast("cuda", enabled=use_amp):
+                d_loss, d_logs = criterion.discriminator_loss(target, x_rec.detach())
 
-        if scaler_d is not None:
-            scaler_d.scale(d_loss).backward()
-        else:
-            d_loss.backward()
-
-        if not is_accum_step:
+            if scaler_d is not None:
+                scaler_d.scale(d_loss).backward()
+                scaler_d.unscale_(optimizer_d)
+            else:
+                d_loss.backward()
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    criterion.discriminator.parameters(),
+                    max_norm=grad_clip_norm,
+                )
             if scaler_d is not None:
                 scaler_d.step(optimizer_d)
                 scaler_d.update()
@@ -268,7 +287,13 @@ def train_one_epoch(
                     print(f"    [Step {step+1}] Expired {total_expired} dead codes")
 
         # ----- Accumulate logs -----
+        if is_accum_step:
+            d_logs = {}
         all_logs = {**gen_logs, **d_logs}
+        # Include VQ monitoring info (z_norm, codebook_norm)
+        for k, v in vq_info.items():
+            if torch.is_tensor(v) and v.ndim == 0:
+                all_logs[k] = v
         for k, v in all_logs.items():
             val = v.item() if torch.is_tensor(v) else v
             if not (math.isnan(val) or math.isinf(val)):
@@ -283,6 +308,13 @@ def train_one_epoch(
                     msg += f" | {k}: {accum[k]/n_steps:.4f}"
             if "association" in accum:
                 msg += f" | assoc: {accum['association']/n_steps:.4f}"
+            if accum.get("grad_norm_count", 0) > 0:
+                avg_gn = accum["grad_norm_sum"] / accum["grad_norm_count"]
+                msg += f" | gnorm: {avg_gn:.2f}"
+            if "z_norm" in accum:
+                msg += f" | z: {accum['z_norm']/n_steps:.1f}"
+            if "codebook_norm" in accum:
+                msg += f" | cb: {accum['codebook_norm']/n_steps:.1f}"
             if nan_steps > 0:
                 msg += f" | nan_skips: {nan_steps}"
             print(msg)
@@ -312,6 +344,7 @@ def run_phase_a(args, device):
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
         persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     print(f"Dataset: {len(dataset)} HQ images, {len(loader)} batches/epoch")
 
@@ -328,8 +361,8 @@ def run_phase_a(args, device):
 
     # AMP scalers
     use_amp = args.amp and device.type == "cuda"
-    scaler_g = GradScaler("cuda", init_scale=2**12) if use_amp else None
-    scaler_d = GradScaler("cuda", init_scale=2**12) if use_amp else None
+    scaler_g = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+    scaler_d = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
     if use_amp:
         print("  Mixed precision (AMP) enabled")
 
@@ -356,14 +389,28 @@ def run_phase_a(args, device):
     if not args.fresh and os.path.exists(os.path.join(ckpt_dir, "latest.pt")):
         ckpt = torch.load(os.path.join(ckpt_dir, "latest.pt"), map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        criterion.discriminator.load_state_dict(ckpt["discriminator"])
+        try:
+            criterion.discriminator.load_state_dict(ckpt["discriminator"])
+        except RuntimeError:
+            print("  WARNING: discriminator state dict incompatible (architecture changed), "
+                  "reinitializing discriminator")
+            # Reinitialize optimizer_d since discriminator params are fresh
+            optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
         optimizer_g.load_state_dict(ckpt["optimizer_g"])
         optimizer_d.load_state_dict(ckpt["optimizer_d"])
         start_epoch = ckpt["epoch"] + 1
         if scheduler_g and "scheduler_g" in ckpt:
             scheduler_g.load_state_dict(ckpt["scheduler_g"])
+        elif scheduler_g:
+            print("  WARNING: scheduler_g state missing from checkpoint, restarting from epoch 0")
         if scheduler_d and "scheduler_d" in ckpt:
             scheduler_d.load_state_dict(ckpt["scheduler_d"])
+        elif scheduler_d:
+            print("  WARNING: scheduler_d state missing from checkpoint, restarting from epoch 0")
+        if scaler_g is not None and "scaler_g" in ckpt:
+            scaler_g.load_state_dict(ckpt["scaler_g"])
+        if scaler_d is not None and "scaler_d" in ckpt:
+            scaler_d.load_state_dict(ckpt["scaler_d"])
         print(f"Resumed from epoch {start_epoch}")
 
     # Training loop
@@ -371,7 +418,7 @@ def run_phase_a(args, device):
     for epoch in range(start_epoch, args.hq_epochs):
         # GAN loss warmup: ramp lambda_dis from 0 to target over first N epochs
         if args.gan_warmup_epochs > 0 and epoch < args.gan_warmup_epochs:
-            warmup_frac = (epoch + 1) / args.gan_warmup_epochs
+            warmup_frac = epoch / args.gan_warmup_epochs
             criterion.lambda_dis = args.lambda_dis * warmup_frac
             print(f"  GAN warmup: lambda_dis = {criterion.lambda_dis:.4f}")
         else:
@@ -406,6 +453,10 @@ def run_phase_a(args, device):
             ckpt["scheduler_g"] = scheduler_g.state_dict()
         if scheduler_d:
             ckpt["scheduler_d"] = scheduler_d.state_dict()
+        if scaler_g is not None:
+            ckpt["scaler_g"] = scaler_g.state_dict()
+        if scaler_d is not None:
+            ckpt["scaler_d"] = scaler_d.state_dict()
         torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
         if (epoch + 1) % args.save_every == 0:
             torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
@@ -438,6 +489,7 @@ def run_phase_b(args, device, hq_model=None):
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
         persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     print(f"Dataset: {len(dataset)} HQ/LQ pairs, {len(loader)} batches/epoch")
     if dataset.masks_dir:
@@ -461,8 +513,8 @@ def run_phase_b(args, device, hq_model=None):
 
     # AMP scalers
     use_amp = args.amp and device.type == "cuda"
-    scaler_g = GradScaler("cuda", init_scale=2**12) if use_amp else None
-    scaler_d = GradScaler("cuda", init_scale=2**12) if use_amp else None
+    scaler_g = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+    scaler_d = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
     if use_amp:
         print("  Mixed precision (AMP) enabled")
 
@@ -489,14 +541,28 @@ def run_phase_b(args, device, hq_model=None):
     if not args.fresh and os.path.exists(os.path.join(ckpt_dir, "latest.pt")):
         ckpt = torch.load(os.path.join(ckpt_dir, "latest.pt"), map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        criterion.discriminator.load_state_dict(ckpt["discriminator"])
+        try:
+            criterion.discriminator.load_state_dict(ckpt["discriminator"])
+        except RuntimeError:
+            print("  WARNING: discriminator state dict incompatible (architecture changed), "
+                  "reinitializing discriminator")
+            # Reinitialize optimizer_d since discriminator params are fresh
+            optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
         optimizer_g.load_state_dict(ckpt["optimizer_g"])
         optimizer_d.load_state_dict(ckpt["optimizer_d"])
         start_epoch = ckpt["epoch"] + 1
         if scheduler_g and "scheduler_g" in ckpt:
             scheduler_g.load_state_dict(ckpt["scheduler_g"])
+        elif scheduler_g:
+            print("  WARNING: scheduler_g state missing from checkpoint, restarting from epoch 0")
         if scheduler_d and "scheduler_d" in ckpt:
             scheduler_d.load_state_dict(ckpt["scheduler_d"])
+        elif scheduler_d:
+            print("  WARNING: scheduler_d state missing from checkpoint, restarting from epoch 0")
+        if scaler_g is not None and "scaler_g" in ckpt:
+            scaler_g.load_state_dict(ckpt["scaler_g"])
+        if scaler_d is not None and "scaler_d" in ckpt:
+            scaler_d.load_state_dict(ckpt["scaler_d"])
         print(f"Resumed from epoch {start_epoch}")
 
     # Training loop
@@ -504,7 +570,7 @@ def run_phase_b(args, device, hq_model=None):
     for epoch in range(start_epoch, args.lq_epochs):
         # GAN loss warmup
         if args.gan_warmup_epochs > 0 and epoch < args.gan_warmup_epochs:
-            warmup_frac = (epoch + 1) / args.gan_warmup_epochs
+            warmup_frac = epoch / args.gan_warmup_epochs
             criterion.lambda_dis = args.lambda_dis * warmup_frac
             print(f"  GAN warmup: lambda_dis = {criterion.lambda_dis:.4f}")
         else:
@@ -538,6 +604,10 @@ def run_phase_b(args, device, hq_model=None):
             ckpt["scheduler_g"] = scheduler_g.state_dict()
         if scheduler_d:
             ckpt["scheduler_d"] = scheduler_d.state_dict()
+        if scaler_g is not None:
+            ckpt["scaler_g"] = scaler_g.state_dict()
+        if scaler_d is not None:
+            ckpt["scaler_d"] = scaler_d.state_dict()
         torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
         if (epoch + 1) % args.save_every == 0:
             torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
@@ -601,6 +671,7 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
         persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     print(f"Dataset: {len(dataset)} HQ/LQ pairs, {len(loader)} batches/epoch")
 
@@ -616,8 +687,11 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
     # Optionally load Phase B's discriminator for continuity
     if args.phase_c_load_disc and args.lq_ckpt:
         disc_ckpt = torch.load(args.lq_ckpt, map_location=device, weights_only=False)
-        criterion.discriminator.load_state_dict(disc_ckpt["discriminator"])
-        print("Loaded Phase B discriminator into Phase C.")
+        try:
+            criterion.discriminator.load_state_dict(disc_ckpt["discriminator"])
+            print("Loaded Phase B discriminator into Phase C.")
+        except RuntimeError:
+            print("  WARNING: Phase B discriminator incompatible, using fresh discriminator")
 
     # Gradient checkpointing
     if args.grad_ckpt:
@@ -626,8 +700,8 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
 
     # AMP scalers
     use_amp = args.amp and device.type == "cuda"
-    scaler_g = GradScaler("cuda", init_scale=2**12) if use_amp else None
-    scaler_d = GradScaler("cuda", init_scale=2**12) if use_amp else None
+    scaler_g = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+    scaler_d = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
     if use_amp:
         print("  Mixed precision (AMP) enabled")
 
@@ -648,14 +722,28 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
     if not args.fresh and os.path.exists(os.path.join(ckpt_dir, "latest.pt")):
         ckpt = torch.load(os.path.join(ckpt_dir, "latest.pt"), map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        criterion.discriminator.load_state_dict(ckpt["discriminator"])
+        try:
+            criterion.discriminator.load_state_dict(ckpt["discriminator"])
+        except RuntimeError:
+            print("  WARNING: discriminator state dict incompatible (architecture changed), "
+                  "reinitializing discriminator")
+            # Reinitialize optimizer_d since discriminator params are fresh
+            optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
         optimizer_g.load_state_dict(ckpt["optimizer_g"])
         optimizer_d.load_state_dict(ckpt["optimizer_d"])
         start_epoch = ckpt["epoch"] + 1
         if scheduler_g and "scheduler_g" in ckpt:
             scheduler_g.load_state_dict(ckpt["scheduler_g"])
+        elif scheduler_g:
+            print("  WARNING: scheduler_g state missing from checkpoint, restarting from epoch 0")
         if scheduler_d and "scheduler_d" in ckpt:
             scheduler_d.load_state_dict(ckpt["scheduler_d"])
+        elif scheduler_d:
+            print("  WARNING: scheduler_d state missing from checkpoint, restarting from epoch 0")
+        if scaler_g is not None and "scaler_g" in ckpt:
+            scaler_g.load_state_dict(ckpt["scaler_g"])
+        if scaler_d is not None and "scaler_d" in ckpt:
+            scaler_d.load_state_dict(ckpt["scaler_d"])
         print(f"Resumed from epoch {start_epoch}")
 
     # Training loop
@@ -663,7 +751,7 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
     for epoch in range(start_epoch, args.assoc_epochs):
         # GAN loss warmup
         if args.gan_warmup_epochs > 0 and epoch < args.gan_warmup_epochs:
-            warmup_frac = (epoch + 1) / args.gan_warmup_epochs
+            warmup_frac = epoch / args.gan_warmup_epochs
             criterion.lambda_dis = args.lambda_dis * warmup_frac
             print(f"  GAN warmup: lambda_dis = {criterion.lambda_dis:.4f}")
         else:
@@ -698,6 +786,10 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
             ckpt["scheduler_g"] = scheduler_g.state_dict()
         if scheduler_d:
             ckpt["scheduler_d"] = scheduler_d.state_dict()
+        if scaler_g is not None:
+            ckpt["scaler_g"] = scaler_g.state_dict()
+        if scaler_d is not None:
+            ckpt["scaler_d"] = scaler_d.state_dict()
         torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
         if (epoch + 1) % args.save_every == 0:
             torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))

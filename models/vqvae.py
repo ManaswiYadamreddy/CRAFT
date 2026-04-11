@@ -388,7 +388,7 @@ class GlobalVQ(nn.Module):
         entropy_weight: Entropy regularization weight (default: 0.1).
     """
 
-    def __init__(self, n_codes=1024, e_dim=512, beta=0.25, ema_decay=0.99,
+    def __init__(self, n_codes=1024, e_dim=512, beta=0.25, ema_decay=0.95,
                  entropy_weight=0.1):
         super().__init__()
         self.n_codes = n_codes
@@ -469,8 +469,11 @@ class GlobalVQ(nn.Module):
         indices = d.argmin(dim=-1)
         z_q_flat = self.embedding(indices)
 
-        # Commitment loss (in float32)
+        # Commitment loss (in float32), soft-clamped to prevent runaway growth
+        # while preserving gradients (hard clamp kills gradients at the cap)
         commitment_loss = self.beta * F.mse_loss(z_flat_f32, z_q_flat.float().detach())
+        soft_cap = 10.0
+        commitment_loss = soft_cap * torch.tanh(commitment_loss / soft_cap)
 
         # Entropy regularization
         avg_probs = F.one_hot(indices, self.n_codes).float().mean(0)
@@ -496,6 +499,8 @@ class GlobalVQ(nn.Module):
         all_info = {
             "perplexity": torch.exp(avg_entropy).detach(),
             "codebook_usage": (avg_probs > 0).float().sum().detach() / self.n_codes,
+            "z_norm": z_flat_f32.detach().norm(dim=-1).mean(),
+            "codebook_norm": embed_f32.detach().norm(dim=-1).mean(),
         }
 
         return z_q, all_losses, all_info

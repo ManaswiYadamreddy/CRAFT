@@ -56,7 +56,7 @@ class VQLevel(nn.Module):
         eps:       Laplace smoothing epsilon for EMA counts (default: 1e-5).
     """
 
-    def __init__(self, n_codes=256, e_dim=512, beta=0.25, ema_decay=0.99, eps=1e-5):
+    def __init__(self, n_codes=256, e_dim=512, beta=0.25, ema_decay=0.95, eps=1e-5):
         super().__init__()
         self.n_codes = n_codes
         self.e_dim = e_dim
@@ -189,6 +189,8 @@ class VQLevel(nn.Module):
 
         # --- Losses (in float32) ---
         commitment_loss = self.beta * F.mse_loss(z_flat_f32, z_q.float().detach())
+        soft_cap = 10.0
+        commitment_loss = soft_cap * torch.tanh(commitment_loss / soft_cap)
 
         # Entropy regularization (HQ-VAE style collapse prevention)
         avg_probs = F.one_hot(indices, self.n_codes).float().mean(dim=0)  # (n_codes,)
@@ -252,7 +254,7 @@ class ResidualVQ(nn.Module):
         e_dim=512,
         n_levels=3,
         beta=0.25,
-        ema_decay=0.99,
+        ema_decay=0.95,
         entropy_weight=0.1,
     ):
         super().__init__()

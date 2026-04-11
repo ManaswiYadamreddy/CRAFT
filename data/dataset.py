@@ -100,7 +100,7 @@ class FFHQPairedDataset(Dataset):
 
         # Transforms
         self.to_tensor = transforms.ToTensor()  # PIL → [0, 1] tensor
-        self.resize = transforms.Resize(
+        self._resize = transforms.Resize(
             (resolution, resolution),
             interpolation=transforms.InterpolationMode.BICUBIC,
             antialias=True,
@@ -114,7 +114,9 @@ class FFHQPairedDataset(Dataset):
 
         # Load HQ
         hq_img = Image.open(hq_path).convert("RGB")
-        hq_01 = self.resize(self.to_tensor(hq_img))  # (3, 512, 512) in [0, 1]
+        hq_01 = self.to_tensor(hq_img)  # (3, H, W) in [0, 1]
+        if hq_01.shape[1] != self.resolution or hq_01.shape[2] != self.resolution:
+            hq_01 = self._resize(hq_01)
         hq = hq_01 * 2.0 - 1.0  # [-1, 1]
 
         output = {
@@ -132,7 +134,9 @@ class FFHQPairedDataset(Dataset):
         # Load LQ
         if not self.hq_only:
             lq_img = Image.open(lq_path).convert("RGB")
-            lq_01 = self.resize(self.to_tensor(lq_img))
+            lq_01 = self.to_tensor(lq_img)
+            if lq_01.shape[1] != self.resolution or lq_01.shape[2] != self.resolution:
+                lq_01 = self._resize(lq_01)
             lq = lq_01 * 2.0 - 1.0
             output["lq"] = lq
             output["lq_01"] = lq_01

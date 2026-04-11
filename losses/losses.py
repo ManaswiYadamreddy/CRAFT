@@ -28,6 +28,8 @@ Loss weights from OSDFace (Eq. 8, 11):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.amp
+from torch.nn.utils import spectral_norm
 import torchvision
 
 
@@ -138,23 +140,25 @@ class VGGPerceptualLoss(nn.Module):
         Returns:
             Scalar perceptual loss (weighted sum of per-layer L2 distances).
         """
-        # VGG forward stays in fp16 (under autocast) to save memory.
-        # Only the per-layer MSE is computed in fp32 to avoid overflow
-        # when gradients are scaled by GradScaler.
-        pred_normalized = self._normalize(pred)
-        with torch.no_grad():
-            target_normalized = self._normalize(target)
-
-        loss = torch.zeros(1, device=pred.device, dtype=torch.float32)
-        x_pred = pred_normalized
-        x_target = target_normalized
-
-        for i, block in enumerate(self.blocks):
-            x_pred = block(x_pred)
+        # Run entire VGG forward in fp32 to prevent overflow in deep layers.
+        # fp16 max is 65504; VGG relu4_1/relu5_1 features regularly exceed this,
+        # causing NaN that propagates through backward.
+        with torch.amp.autocast("cuda", enabled=False):
+            pred_f32 = pred if pred.dtype == torch.float32 else pred.float()
+            target_f32 = target if target.dtype == torch.float32 else target.float()
+            pred_normalized = self._normalize(pred_f32)
             with torch.no_grad():
-                x_target = block(x_target)
-            # Cast to fp32 only for the MSE to prevent overflow in loss/grads
-            loss = loss + self.layer_weights[i] * F.mse_loss(x_pred.float(), x_target.float())
+                target_normalized = self._normalize(target_f32)
+
+            loss = torch.zeros(1, device=pred.device, dtype=torch.float32)
+            x_pred = pred_normalized
+            x_target = target_normalized
+
+            for i, block in enumerate(self.blocks):
+                x_pred = block(x_pred)
+                with torch.no_grad():
+                    x_target = block(x_target)
+                loss = loss + self.layer_weights[i] * F.mse_loss(x_pred, x_target)
 
         return loss
 
@@ -184,7 +188,7 @@ class PatchDiscriminator(nn.Module):
         super().__init__()
 
         layers = [
-            nn.Conv2d(in_channels, ndf, kernel_size=4, stride=2, padding=1),
+            spectral_norm(nn.Conv2d(in_channels, ndf, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
         ]
 
@@ -193,22 +197,20 @@ class PatchDiscriminator(nn.Module):
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
             layers += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=4, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(ndf * nf_mult),
+                spectral_norm(nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=4, stride=2, padding=1, bias=False)),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
 
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
         layers += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=4, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * nf_mult),
+            spectral_norm(nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=4, stride=1, padding=1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
         ]
 
         # Final 1-channel output (real/fake prediction per patch)
         layers += [
-            nn.Conv2d(ndf * nf_mult, 1, kernel_size=4, stride=1, padding=1),
+            spectral_norm(nn.Conv2d(ndf * nf_mult, 1, kernel_size=4, stride=1, padding=1)),
         ]
 
         self.model = nn.Sequential(*layers)
@@ -395,11 +397,14 @@ class Stage1VQLoss(nn.Module):
         # Reconstruction
         l1 = self.l1_loss(pred, target)
 
-        # Perceptual
+        # Perceptual — clamp to prevent single-batch spikes from
+        # wiping out all other gradient signals after grad clipping
         l_per = self.perceptual_loss(pred, target)
+        l_per = torch.clamp(l_per, max=150.0)
 
         # Adversarial (generator wants discriminator to say "real")
         l_gan_g = gan_g_loss(self.discriminator, pred)
+        l_gan_g = torch.clamp(l_gan_g, max=50.0)
 
         # Start with base losses
         total = l1 + self.lambda_per * l_per + self.lambda_dis * l_gan_g + vq_loss

@@ -212,6 +212,10 @@ def train_one_epoch(
                       f"(total NaN steps: {nan_steps})")
             optimizer_g.zero_grad()
             optimizer_d.zero_grad()
+            # Free the forward-pass graph to avoid OOM on next iteration
+            del gen_loss, gen_logs, x_rec, z, z_q, vq_losses, vq_info
+            del z_H_flat, z_L_flat
+            torch.cuda.empty_cache()
             continue
 
         if scaler_g is not None:

@@ -204,19 +204,13 @@ def train_one_epoch(
             )
             gen_loss = gen_loss * loss_scale
 
-        # NaN detection — skip this step entirely
+        # NaN/Inf detection — log but let AMP scaler handle it naturally
         if torch.isnan(gen_loss) or torch.isinf(gen_loss):
             nan_steps += 1
             if nan_steps <= 3 or nan_steps % 100 == 0:
-                print(f"  [Step {step+1}] NaN/Inf detected in gen_loss, skipping step "
+                print(f"  [Step {step+1}] NaN/Inf detected in gen_loss, "
+                      f"AMP scaler will skip & reduce scale "
                       f"(total NaN steps: {nan_steps})")
-            optimizer_g.zero_grad()
-            optimizer_d.zero_grad()
-            # Free the forward-pass graph to avoid OOM on next iteration
-            del gen_loss, gen_logs, x_rec, z, z_q, vq_losses, vq_info
-            del z_H_flat, z_L_flat
-            torch.cuda.empty_cache()
-            continue
 
         if scaler_g is not None:
             scaler_g.scale(gen_loss).backward()
@@ -224,17 +218,23 @@ def train_one_epoch(
             gen_loss.backward()
 
         if not is_accum_step:
-            if grad_clip_norm > 0:
-                if scaler_g is not None:
-                    scaler_g.unscale_(optimizer_g)
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    max_norm=grad_clip_norm,
-                )
             if scaler_g is not None:
+                scaler_g.unscale_(optimizer_g)
+                # Clip gradients only when they are finite
+                if all(not torch.isinf(p.grad).any() and not torch.isnan(p.grad).any()
+                       for p in model.parameters() if p.requires_grad and p.grad is not None):
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        max_norm=grad_clip_norm,
+                    )
                 scaler_g.step(optimizer_g)
                 scaler_g.update()
             else:
+                if grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        max_norm=grad_clip_norm,
+                    )
                 optimizer_g.step()
 
         # ----- Discriminator step -----

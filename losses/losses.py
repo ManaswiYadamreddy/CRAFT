@@ -132,6 +132,10 @@ class VGGPerceptualLoss(nn.Module):
             features.append(x)
         return features
 
+    # fp16 safe range: clamp activations to prevent overflow in deep VGG layers
+    # while keeping memory-efficient fp16 forward pass
+    _FP16_MAX = 65000.0
+
     def forward(self, pred, target):
         """
         Args:
@@ -140,25 +144,26 @@ class VGGPerceptualLoss(nn.Module):
         Returns:
             Scalar perceptual loss (weighted sum of per-layer L2 distances).
         """
-        # Run entire VGG forward in fp32 to prevent overflow in deep layers.
-        # fp16 max is 65504; VGG relu4_1/relu5_1 features regularly exceed this,
-        # causing NaN that propagates through backward.
-        with torch.amp.autocast("cuda", enabled=False):
-            pred_f32 = pred if pred.dtype == torch.float32 else pred.float()
-            target_f32 = target if target.dtype == torch.float32 else target.float()
-            pred_normalized = self._normalize(pred_f32)
+        # VGG forward stays in fp16 (under autocast) to save memory.
+        # Deep layers (relu4_1, relu5_1) can overflow fp16 max (65504),
+        # so we clamp activations after each block. MSE is computed in
+        # fp32 to prevent gradient overflow.
+        pred_normalized = self._normalize(pred)
+        with torch.no_grad():
+            target_normalized = self._normalize(target)
+
+        loss = torch.zeros(1, device=pred.device, dtype=torch.float32)
+        x_pred = pred_normalized
+        x_target = target_normalized
+
+        for i, block in enumerate(self.blocks):
+            x_pred = block(x_pred)
+            x_pred = x_pred.clamp(-self._FP16_MAX, self._FP16_MAX)
             with torch.no_grad():
-                target_normalized = self._normalize(target_f32)
-
-            loss = torch.zeros(1, device=pred.device, dtype=torch.float32)
-            x_pred = pred_normalized
-            x_target = target_normalized
-
-            for i, block in enumerate(self.blocks):
-                x_pred = block(x_pred)
-                with torch.no_grad():
-                    x_target = block(x_target)
-                loss = loss + self.layer_weights[i] * F.mse_loss(x_pred, x_target)
+                x_target = block(x_target)
+                x_target = x_target.clamp(-self._FP16_MAX, self._FP16_MAX)
+            # Cast to fp32 for MSE to prevent overflow in loss/grads
+            loss = loss + self.layer_weights[i] * F.mse_loss(x_pred.float(), x_target.float())
 
         return loss
 
@@ -397,14 +402,16 @@ class Stage1VQLoss(nn.Module):
         # Reconstruction
         l1 = self.l1_loss(pred, target)
 
-        # Perceptual — clamp to prevent single-batch spikes from
-        # wiping out all other gradient signals after grad clipping
+        # Perceptual — soft-cap to dampen single-batch spikes while
+        # preserving gradients (hard clamp kills gradients at the cap)
         l_per = self.perceptual_loss(pred, target)
-        l_per = torch.clamp(l_per, max=150.0)
+        per_cap = 200.0
+        l_per = per_cap * torch.tanh(l_per / per_cap)
 
         # Adversarial (generator wants discriminator to say "real")
         l_gan_g = gan_g_loss(self.discriminator, pred)
-        l_gan_g = torch.clamp(l_gan_g, max=50.0)
+        gan_cap = 50.0
+        l_gan_g = gan_cap * torch.tanh(l_gan_g / gan_cap)
 
         # Start with base losses
         total = l1 + self.lambda_per * l_per + self.lambda_dis * l_gan_g + vq_loss

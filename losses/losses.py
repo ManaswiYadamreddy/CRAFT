@@ -138,21 +138,26 @@ class VGGPerceptualLoss(nn.Module):
         Returns:
             Scalar perceptual loss (weighted sum of per-layer L2 distances).
         """
-        # We need gradients for pred features (backprop to generator)
-        # but not for target features
-        pred_normalized = self._normalize(pred)
-        with torch.no_grad():
-            target_normalized = self._normalize(target)
+        # Run VGG in fp32 to avoid fp16 overflow in deep feature layers.
+        # Autocast is disabled here because VGG activations at relu4/relu5
+        # easily exceed fp16 range (~65504), causing inf/NaN gradients.
+        with torch.amp.autocast("cuda", enabled=False):
+            pred_f32 = pred.float()
+            target_f32 = target.float()
 
-        loss = 0.0
-        x_pred = pred_normalized
-        x_target = target_normalized
-
-        for i, block in enumerate(self.blocks):
-            x_pred = block(x_pred)
+            pred_normalized = self._normalize(pred_f32)
             with torch.no_grad():
-                x_target = block(x_target)
-            loss = loss + self.layer_weights[i] * F.mse_loss(x_pred, x_target)
+                target_normalized = self._normalize(target_f32)
+
+            loss = 0.0
+            x_pred = pred_normalized
+            x_target = target_normalized
+
+            for i, block in enumerate(self.blocks):
+                x_pred = block(x_pred)
+                with torch.no_grad():
+                    x_target = block(x_target)
+                loss = loss + self.layer_weights[i] * F.mse_loss(x_pred, x_target)
 
         return loss
 

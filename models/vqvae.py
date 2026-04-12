@@ -399,21 +399,31 @@ class GlobalVQ(nn.Module):
 
         self.embedding = nn.Embedding(n_codes, e_dim)
         self.embedding.weight.data.uniform_(-1.0 / n_codes, 1.0 / n_codes)
+        # Normalize initial codebook to unit sphere
+        with torch.no_grad():
+            self.embedding.weight.data.copy_(
+                F.normalize(self.embedding.weight.data, dim=1)
+            )
 
         self.register_buffer("ema_count", torch.zeros(n_codes))
         self.register_buffer("ema_weight", self.embedding.weight.data.clone())
         self.register_buffer("inited", torch.tensor(False))
 
+        # Learnable scale: decoder can recover magnitude via this scalar
+        # Initialized to 8.0 (typical z_norm / sqrt(e_dim) baseline)
+        self.codebook_scale = nn.Parameter(torch.tensor(8.0))
+
     @torch.no_grad()
     def _init_codebook(self, z_flat):
+        """Initialize codebook from first batch (L2-normalized)."""
         if self.inited:
             return
         n = z_flat.shape[0]
         if n >= self.n_codes:
             perm = torch.randperm(n, device=z_flat.device)[:self.n_codes]
-            self.embedding.weight.data.copy_(z_flat[perm])
+            self.embedding.weight.data.copy_(F.normalize(z_flat[perm], dim=1))
         else:
-            self.embedding.weight.data[:n].copy_(z_flat)
+            self.embedding.weight.data[:n].copy_(F.normalize(z_flat[:n], dim=1))
         self.ema_weight.data.copy_(self.embedding.weight.data)
         self.ema_count.fill_(1.0)
         self.inited.fill_(True)
@@ -429,7 +439,9 @@ class GlobalVQ(nn.Module):
 
         n = self.ema_count.sum()
         count_smoothed = (self.ema_count + 1e-5) / (n + self.n_codes * 1e-5) * n
-        self.embedding.weight.data.copy_(self.ema_weight / count_smoothed.unsqueeze(1))
+        updated = self.ema_weight / count_smoothed.unsqueeze(1)
+        # Re-normalize codebook to unit sphere after EMA update
+        self.embedding.weight.data.copy_(F.normalize(updated, dim=1))
 
     def forward(self, z, images=None, masks=None):
         """
@@ -452,28 +464,29 @@ class GlobalVQ(nn.Module):
 
         # Force float32 for VQ ops to prevent overflow under AMP
         z_flat_f32 = z_flat.float()
+
+        # L2-normalize encoder outputs before quantization
+        # This constrains z and codebook to the unit hypersphere,
+        # preventing the norm drift that causes NaN
+        z_norm_raw = z_flat_f32.detach().norm(dim=-1).mean()  # for logging
+        z_flat_f32_normed = F.normalize(z_flat_f32, dim=1)
+
         embed_f32 = self.embedding.weight.float()
+        # Codebook is already normalized via _ema_update / _init_codebook
 
-        # Data-driven init
+        # Data-driven init (from normalized vectors)
         if self.training and not self.inited:
-            self._init_codebook(z_flat_f32)
+            self._init_codebook(z_flat_f32_normed)
 
-        # Distance computation (in float32 to avoid overflow with 512-dim vectors)
-        d = (
-            z_flat_f32.pow(2).sum(1, keepdim=True)
-            + embed_f32.pow(2).sum(1)
-            - 2.0 * z_flat_f32 @ embed_f32.t()
-        )
+        # Distance on unit sphere: ||a-b||^2 = 2 - 2*a·b (since ||a||=||b||=1)
+        # Using dot product is more numerically stable
+        sim = z_flat_f32_normed @ embed_f32.t()  # (N, n_codes)
+        indices = sim.argmax(dim=-1)  # closest = highest cosine similarity
+        z_q_flat = self.embedding(indices)  # already normalized
 
-        # Hard assignment
-        indices = d.argmin(dim=-1)
-        z_q_flat = self.embedding(indices)
-
-        # Commitment loss (in float32), soft-clamped to prevent runaway growth
-        # while preserving gradients (hard clamp kills gradients at the cap)
-        commitment_loss = self.beta * F.mse_loss(z_flat_f32, z_q_flat.float().detach())
-        soft_cap = 10.0
-        commitment_loss = soft_cap * torch.tanh(commitment_loss / soft_cap)
+        # Commitment loss on normalized vectors — bounded by construction
+        # since both lie on unit sphere, MSE ∈ [0, 4]
+        commitment_loss = self.beta * F.mse_loss(z_flat_f32_normed, z_q_flat.float().detach())
 
         # Entropy regularization
         avg_probs = F.one_hot(indices, self.n_codes).float().mean(0)
@@ -481,15 +494,21 @@ class GlobalVQ(nn.Module):
         max_entropy = math.log(self.n_codes)
         entropy_loss = (max_entropy - avg_entropy) * self.entropy_weight
 
-        # EMA update (in float32)
+        # EMA update on normalized vectors
         if self.training:
-            self._ema_update(z_flat_f32, indices)
+            self._ema_update(z_flat_f32_normed, indices)
 
-        # Straight-through (in original dtype for downstream compatibility)
-        z_q_flat = z_flat + (z_q_flat - z_flat).detach()
+        # Apply learnable scale so decoder can recover magnitude
+        scale = self.codebook_scale.abs()  # ensure positive
+        z_q_scaled = z_q_flat * scale
+
+        # Straight-through: gradient flows to z_flat (pre-normalization)
+        # We use the normalized z as the "input" side of straight-through
+        z_flat_normed = z_flat_f32_normed.to(z_flat.dtype)
+        z_q_st = z_flat_normed * scale + (z_q_scaled - z_flat_normed * scale).detach()
 
         # Reshape back
-        z_q = z_q_flat.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        z_q = z_q_st.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
         all_losses = {
             "commitment": commitment_loss,
@@ -499,8 +518,9 @@ class GlobalVQ(nn.Module):
         all_info = {
             "perplexity": torch.exp(avg_entropy).detach(),
             "codebook_usage": (avg_probs > 0).float().sum().detach() / self.n_codes,
-            "z_norm": z_flat_f32.detach().norm(dim=-1).mean(),
+            "z_norm": z_norm_raw,
             "codebook_norm": embed_f32.detach().norm(dim=-1).mean(),
+            "codebook_scale": scale.detach(),
         }
 
         return z_q, all_losses, all_info

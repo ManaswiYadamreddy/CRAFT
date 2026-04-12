@@ -64,9 +64,13 @@ class VQLevel(nn.Module):
         self.ema_decay = ema_decay
         self.eps = eps
 
-        # Codebook embeddings
+        # Codebook embeddings (initialized on unit sphere)
         self.embedding = nn.Embedding(n_codes, e_dim)
         self.embedding.weight.data.uniform_(-1.0 / n_codes, 1.0 / n_codes)
+        with torch.no_grad():
+            self.embedding.weight.data.copy_(
+                F.normalize(self.embedding.weight.data, dim=1)
+            )
 
         # EMA tracking buffers (not model parameters, not saved in optimizer)
         self.register_buffer("ema_count", torch.zeros(n_codes))
@@ -79,17 +83,15 @@ class VQLevel(nn.Module):
 
     @torch.no_grad()
     def _init_codebook(self, z_flat):
-        """Initialize codebook from first batch of data (better than random)."""
+        """Initialize codebook from first batch of data (L2-normalized)."""
         if self.inited:
             return
         n = z_flat.shape[0]
         if n >= self.n_codes:
-            # Pick n_codes random vectors from the batch
             perm = torch.randperm(n, device=z_flat.device)[:self.n_codes]
-            self.embedding.weight.data.copy_(z_flat[perm])
+            self.embedding.weight.data.copy_(F.normalize(z_flat[perm], dim=1))
         else:
-            # If batch is smaller than codebook, fill what we can
-            self.embedding.weight.data[:n].copy_(z_flat)
+            self.embedding.weight.data[:n].copy_(F.normalize(z_flat[:n], dim=1))
         self.ema_weight.data.copy_(self.embedding.weight.data)
         self.ema_count.fill_(1.0)  # avoid division by zero on first update
         self.inited.fill_(True)
@@ -111,9 +113,9 @@ class VQLevel(nn.Module):
             / (n + self.n_codes * self.eps)
             * n
         )
-        self.embedding.weight.data.copy_(
-            self.ema_weight / count_smoothed.unsqueeze(1)
-        )
+        updated = self.ema_weight / count_smoothed.unsqueeze(1)
+        # Re-normalize codebook to unit sphere after EMA update
+        self.embedding.weight.data.copy_(F.normalize(updated, dim=1))
 
     @torch.no_grad()
     def _expire_dead_codes(self, z_flat, indices, threshold=1.0):
@@ -132,11 +134,11 @@ class VQLevel(nn.Module):
         if n_dead == 0:
             return 0
 
-        # Replace dead codes with random samples from the batch
+        # Replace dead codes with random samples from the batch (normalized)
         n_available = z_flat.shape[0]
         if n_available > 0:
             replace_indices = torch.randint(0, n_available, (n_dead,), device=z_flat.device)
-            replacements = z_flat[replace_indices]
+            replacements = F.normalize(z_flat[replace_indices], dim=1)
 
             # In DDP, broadcast replacements from rank 0 to prevent codebook divergence
             if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -154,7 +156,7 @@ class VQLevel(nn.Module):
 
     def forward(self, z_flat):
         """
-        Quantize input features.
+        Quantize input features with L2 normalization.
 
         Args:
             z_flat: (N, e_dim) flattened feature vectors.
@@ -162,35 +164,34 @@ class VQLevel(nn.Module):
                     across the entire batch.
 
         Returns:
-            z_q:     (N, e_dim) quantized vectors with straight-through gradient.
+            z_q:     (N, e_dim) quantized vectors (unit-norm) with straight-through gradient.
             indices: (N,) integer codebook indices.
             losses:  dict with 'commitment' and 'entropy' scalar losses.
             info:    dict with monitoring metrics (perplexity, usage ratio).
         """
         # Force float32 for VQ ops to prevent overflow under AMP
         z_flat_f32 = z_flat.float()
+
+        # L2-normalize input before quantization
+        z_flat_f32_normed = F.normalize(z_flat_f32, dim=1)
+
         embed_f32 = self.embedding.weight.float()
+        # Codebook is already normalized via _ema_update / _init_codebook
 
         # Initialize codebook from data on first forward pass
         if self.training and not self.inited:
-            self._init_codebook(z_flat_f32)
+            self._init_codebook(z_flat_f32_normed)
 
-        # --- Distance computation (in float32) ---
-        # ||z - e||^2 = ||z||^2 + ||e||^2 - 2 z·e^T
-        d = (
-            z_flat_f32.pow(2).sum(dim=1, keepdim=True)
-            + embed_f32.pow(2).sum(dim=1)
-            - 2.0 * z_flat_f32 @ embed_f32.t()
-        )  # (N, n_codes)
+        # --- Cosine similarity (both on unit sphere) ---
+        sim = z_flat_f32_normed @ embed_f32.t()  # (N, n_codes)
 
         # --- Hard assignment ---
-        indices = d.argmin(dim=-1)  # (N,)
-        z_q = self.embedding(indices)  # (N, e_dim)
+        indices = sim.argmax(dim=-1)  # (N,)
+        z_q = self.embedding(indices)  # (N, e_dim), unit-norm
 
         # --- Losses (in float32) ---
-        commitment_loss = self.beta * F.mse_loss(z_flat_f32, z_q.float().detach())
-        soft_cap = 10.0
-        commitment_loss = soft_cap * torch.tanh(commitment_loss / soft_cap)
+        # On unit sphere, MSE ∈ [0, 4] — naturally bounded, no soft-cap needed
+        commitment_loss = self.beta * F.mse_loss(z_flat_f32_normed, z_q.float().detach())
 
         # Entropy regularization (HQ-VAE style collapse prevention)
         avg_probs = F.one_hot(indices, self.n_codes).float().mean(dim=0)  # (n_codes,)
@@ -198,18 +199,19 @@ class VQLevel(nn.Module):
         max_entropy = math.log(self.n_codes)
         entropy_loss = max_entropy - avg_entropy
 
-        # --- EMA codebook update (in float32) ---
+        # --- EMA codebook update on normalized vectors ---
         if self.training:
-            self._ema_update(z_flat_f32, indices)
+            self._ema_update(z_flat_f32_normed, indices)
 
         # --- Straight-through estimator (in original dtype) ---
-        z_q_st = z_flat + (z_q - z_flat).detach()
+        z_normed = z_flat_f32_normed.to(z_flat.dtype)
+        z_q_st = z_normed + (z_q - z_normed).detach()
 
         # --- Monitoring info ---
         info = {
             "perplexity": torch.exp(avg_entropy).detach(),
             "codebook_usage": (avg_probs > 0).float().sum().detach() / self.n_codes,
-            "mean_distance": d.min(dim=-1).values.mean().detach(),
+            "mean_cosine_sim": sim.max(dim=-1).values.mean().detach(),
         }
 
         losses = {
@@ -267,37 +269,39 @@ class ResidualVQ(nn.Module):
             [VQLevel(n_codes, e_dim, beta, ema_decay) for _ in range(n_levels)]
         )
 
+        # Learnable scale: decoder can recover magnitude via this scalar
+        self.codebook_scale = nn.Parameter(torch.tensor(8.0))
+
     def forward(self, z):
         """
-        Quantize features through all residual levels.
-        
+        Quantize features through all residual levels with L2 normalization.
+
+        Input z is L2-normalized before quantization. Each level operates on
+        unit-norm vectors. A learnable scale is applied after quantization
+        so the decoder can recover magnitude.
+
         Args:
             z: (N, e_dim) flattened feature vectors for one region.
-               N = total number of spatial positions in this region across 
-               the batch. For example, if batch_size=4 and a region covers 
-               50 positions per image, N=200.
-        
+
         Returns:
-            z_q:        (N, e_dim) quantized vectors with straight-through 
+            z_q:        (N, e_dim) quantized+scaled vectors with straight-through
                         gradient to z.
-            all_losses: dict with aggregated losses:
-                        'commitment' — sum of per-level commitment losses
-                        'entropy'    — weighted sum of per-level entropy losses
-                        'total_vq'   — commitment + entropy (ready to backprop)
+            all_losses: dict with aggregated losses.
             all_info:   dict with per-level monitoring metrics and indices.
         """
+        # L2-normalize input before residual quantization
+        z_normed = F.normalize(z.float(), dim=1).to(z.dtype)
+
         # Accumulate hard-quantized vectors (no gradient)
-        z_q_hard_sum = torch.zeros_like(z)
-        residual = z
+        z_q_hard_sum = torch.zeros_like(z_normed)
+        residual = z_normed
 
         all_losses = {"commitment": 0.0, "entropy": 0.0}
         all_indices = []
         all_info = {}
 
         for lvl, vq_level in enumerate(self.levels):
-            # Quantize the current residual
-            # Note: vq_level returns z_q with straight-through, but we only
-            # use the hard-quantized value for residual computation
+            # VQLevel internally normalizes its input again and works on unit sphere
             z_q_st, indices, losses, info = vq_level(residual)
 
             # The actual hard-quantized value (no gradient) for residual calc
@@ -319,9 +323,13 @@ class ResidualVQ(nn.Module):
                 residual.detach().norm(dim=-1).mean()
             )
 
+        # Apply learnable scale so decoder can recover magnitude
+        scale = self.codebook_scale.abs()
+
         # --- Single straight-through for the entire RQ ---
-        # Forward: z_q_hard_sum (discrete). Backward: gradient to z.
-        z_q = z + (z_q_hard_sum - z).detach()
+        z_q_hard_scaled = z_q_hard_sum * scale
+        z_normed_scaled = z_normed * scale
+        z_q = z_normed_scaled + (z_q_hard_scaled - z_normed_scaled).detach()
 
         # Weight the entropy loss
         all_losses["entropy"] = all_losses["entropy"] * self.entropy_weight
@@ -342,23 +350,22 @@ class ResidualVQ(nn.Module):
     def encode(self, z):
         """
         Encode features to multi-level codebook indices (inference only).
-        
+
         Args:
             z: (N, e_dim) feature vectors.
-        
+
         Returns:
             indices_list: list of n_levels tensors, each (N,) with int indices.
         """
         indices_list = []
-        residual = z
+        # Normalize input
+        residual = F.normalize(z.float(), dim=1).to(z.dtype)
 
         for vq_level in self.levels:
-            d = (
-                residual.pow(2).sum(1, keepdim=True)
-                + vq_level.embedding.weight.pow(2).sum(1)
-                - 2.0 * residual @ vq_level.embedding.weight.t()
-            )
-            indices = d.argmin(dim=-1)
+            # Normalize residual per level (same as training)
+            r_normed = F.normalize(residual.float(), dim=1).to(residual.dtype)
+            sim = r_normed @ vq_level.embedding.weight.t()
+            indices = sim.argmax(dim=-1)
             z_q = vq_level.embedding(indices)
             residual = residual - z_q
             indices_list.append(indices)
@@ -369,12 +376,12 @@ class ResidualVQ(nn.Module):
     def decode(self, indices_list):
         """
         Decode multi-level indices back to quantized feature vectors.
-        
+
         Args:
             indices_list: list of n_levels tensors, each (N,) with int indices.
-        
+
         Returns:
-            z_q: (N, e_dim) reconstructed quantized vectors.
+            z_q: (N, e_dim) reconstructed quantized vectors (scaled).
         """
         z_q = torch.zeros(
             indices_list[0].shape[0],
@@ -384,31 +391,30 @@ class ResidualVQ(nn.Module):
         )
         for lvl, indices in enumerate(indices_list):
             z_q = z_q + self.levels[lvl].embedding(indices)
-        return z_q
+        # Apply learnable scale (same as training forward)
+        return z_q * self.codebook_scale.abs()
 
     @torch.no_grad()
     def expire_dead_codes(self, z):
         """
         Replace dead codebook entries across all levels.
         Call periodically during training (e.g., every N steps).
-        
+
         Args:
             z: (N, e_dim) encoder outputs to sample replacements from.
-        
+
         Returns:
             n_expired: total number of codes replaced across all levels.
         """
         total_expired = 0
-        residual = z
+        # Normalize input
+        residual = F.normalize(z.float(), dim=1).to(z.dtype)
 
         for vq_level in self.levels:
-            d = (
-                residual.pow(2).sum(1, keepdim=True)
-                + vq_level.embedding.weight.pow(2).sum(1)
-                - 2.0 * residual @ vq_level.embedding.weight.t()
-            )
-            indices = d.argmin(dim=-1)
-            n_expired = vq_level._expire_dead_codes(residual, indices)
+            r_normed = F.normalize(residual.float(), dim=1).to(residual.dtype)
+            sim = r_normed @ vq_level.embedding.weight.t()
+            indices = sim.argmax(dim=-1)
+            n_expired = vq_level._expire_dead_codes(r_normed, indices)
             total_expired += n_expired
             z_q = vq_level.embedding(indices)
             residual = residual - z_q

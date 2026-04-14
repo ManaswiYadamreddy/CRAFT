@@ -403,8 +403,16 @@ def run_phase_a(args, device):
                   "reinitializing discriminator")
             # Reinitialize optimizer_d since discriminator params are fresh
             optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
-        optimizer_g.load_state_dict(ckpt["optimizer_g"])
-        optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        if "optimizer_g" in ckpt:
+            optimizer_g.load_state_dict(ckpt["optimizer_g"])
+        else:
+            print("  NOTE: optimizer_g state missing from checkpoint "
+                  "(e.g. healed ckpt) — starting with fresh optimizer state.")
+        if "optimizer_d" in ckpt:
+            optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        else:
+            print("  NOTE: optimizer_d state missing from checkpoint — "
+                  "starting with fresh optimizer state.")
         start_epoch = ckpt["epoch"] + 1
         if scheduler_g and "scheduler_g" in ckpt:
             scheduler_g.load_state_dict(ckpt["scheduler_g"])
@@ -565,8 +573,16 @@ def run_phase_b(args, device, hq_model=None):
                   "reinitializing discriminator")
             # Reinitialize optimizer_d since discriminator params are fresh
             optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
-        optimizer_g.load_state_dict(ckpt["optimizer_g"])
-        optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        if "optimizer_g" in ckpt:
+            optimizer_g.load_state_dict(ckpt["optimizer_g"])
+        else:
+            print("  NOTE: optimizer_g state missing from checkpoint "
+                  "(e.g. healed ckpt) — starting with fresh optimizer state.")
+        if "optimizer_d" in ckpt:
+            optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        else:
+            print("  NOTE: optimizer_d state missing from checkpoint — "
+                  "starting with fresh optimizer state.")
         start_epoch = ckpt["epoch"] + 1
         if scheduler_g and "scheduler_g" in ckpt:
             scheduler_g.load_state_dict(ckpt["scheduler_g"])
@@ -746,8 +762,16 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
                   "reinitializing discriminator")
             # Reinitialize optimizer_d since discriminator params are fresh
             optimizer_d = torch.optim.Adam(criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999))
-        optimizer_g.load_state_dict(ckpt["optimizer_g"])
-        optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        if "optimizer_g" in ckpt:
+            optimizer_g.load_state_dict(ckpt["optimizer_g"])
+        else:
+            print("  NOTE: optimizer_g state missing from checkpoint "
+                  "(e.g. healed ckpt) — starting with fresh optimizer state.")
+        if "optimizer_d" in ckpt:
+            optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        else:
+            print("  NOTE: optimizer_d state missing from checkpoint — "
+                  "starting with fresh optimizer state.")
         start_epoch = ckpt["epoch"] + 1
         if scheduler_g and "scheduler_g" in ckpt:
             scheduler_g.load_state_dict(ckpt["scheduler_g"])

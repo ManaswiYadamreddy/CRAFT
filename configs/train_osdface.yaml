@@ -1,0 +1,57 @@
+# OSDFace Stage 1 (VRE) — Training configuration
+#
+# Trains two flat VQ-VAEs (HQ branch + LQ branch) jointly with an
+# HQ↔LQ feature association loss (OSDFace Eq. 9–10).
+#
+# NOTE: To stay comparable with CRAFT, this setup uses the same unit-sphere
+# codebook + cosine similarity quantizer (GlobalVQ) that CRAFT uses, instead
+# of the raw-space L2 quantizer described in the original OSDFace paper.
+#
+# Usage:
+#   python train_osdface_stage1.py --config configs/train_osdface.yaml
+#   # Warm-start HQ branch from a CRAFT Phase A checkpoint (recommended):
+#   python train_osdface_stage1.py --config configs/train_osdface.yaml \
+#       --hq_ckpt /path/to/checkpoints/phase_a/final.pt --freeze_hq
+
+# Data
+data_root: /projectnb/cs585/projects/craft/data/train
+num_workers: 12
+
+# Architecture (must match CRAFT for apples-to-apples comparison)
+embed_dim: 512
+hq_n_codes: 1024
+lq_n_codes: 1024
+
+# Training hyperparameters
+batch_size: 32
+lr: 1.44e-4
+lr_schedule: cosine
+warmup_epochs: 2
+grad_clip_norm: 1.0
+epochs: 50                 # Stage 1 total epochs (paper: 50)
+
+# Loss weights (OSDFace Eq. 8, 11)
+lambda_per: 1.0
+lambda_dis: 0.8
+lambda_assoc: 1.0
+assoc_warmup_epochs: 5     # keep lambda_assoc=0 for first N epochs
+gan_warmup_epochs: 2
+
+# HQ branch init / freezing
+hq_ckpt: "/projectnb/cs585/projects/craft/checkpoints/phase_a/final.pt"                # optional: CRAFT Phase A checkpoint to warm-start HQ
+freeze_hq: true            # HQ branch frozen by default — reuses CRAFT Phase A
+
+# Checkpointing
+ckpt_dir: /projectnb/cs585/projects/craft/checkpoints_osdface
+fresh: false
+save_every: 1
+
+# Memory optimization
+amp: true
+grad_ckpt: true
+grad_accum_steps: 4
+
+# Misc
+expire_every: 1000
+log_every: 50
+device: cuda

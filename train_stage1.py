@@ -319,6 +319,13 @@ def train_one_epoch(
                 msg += f" | nan_skips: {nan_steps}"
             print(msg)
 
+            # ----- Per-region codebook diagnostics (Phase B/C only) -----
+            if phase != "A" and hasattr(model.quantizer, "print_detailed_stats"):
+                with torch.no_grad():
+                    model.quantizer.print_detailed_stats(
+                        z=z.detach(), masks=masks, prefix="    ",
+                    )
+
     if nan_steps > 0:
         print(f"  WARNING: {nan_steps} NaN/Inf steps skipped this epoch")
 

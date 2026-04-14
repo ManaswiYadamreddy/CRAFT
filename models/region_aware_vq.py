@@ -157,7 +157,7 @@ class RegionAwareVQ(nn.Module):
             z_q_region, losses, info = rq(region_features)
 
             # Scatter: place quantized vectors back into output
-            z_q_flat[mask] = z_q_region
+            z_q_flat[mask] = z_q_region.to(z_q_flat.dtype)
 
             # Aggregate losses (weighted equally across regions)
             for key in ("commitment", "entropy", "total_vq"):
@@ -228,6 +228,85 @@ class RegionAwareVQ(nn.Module):
                 expired[name] = 0
 
         return expired
+
+    @torch.no_grad()
+    def get_detailed_stats(self, z=None, masks=None, images=None):
+        """
+        Per-region, per-level diagnostic dump.
+
+        For each region × RQ level, report:
+            - codebook norm (mean, std)
+            - dead-code fraction (EMA count < 1.0)
+            - EMA count (min / max / mean)
+            - learnable codebook_scale
+            - n_positions assigned to this region this batch (if z+masks given)
+
+        If z and masks (or images) are supplied, also returns the encoder
+        feature norm (z_norm) so you can compare it against codebook norm.
+        """
+        stats = {}
+
+        if z is not None:
+            B, C, H, W = z.shape
+            if masks is None and images is not None:
+                masks = self.face_parser.get_region_masks(
+                    images, target_h=H, target_w=W
+                )
+            stats["z_norm_mean"] = z.float().norm(dim=1).mean().item()
+            stats["z_norm_std"] = z.float().norm(dim=1).std().item()
+
+        for name in REGION_NAMES:
+            rq = self.region_codebooks[name]
+            scale = rq.codebook_scale.abs().item()
+            stats[f"{name}/codebook_scale"] = scale
+
+            if z is not None and masks is not None:
+                mask = masks[name].reshape(B, H * W)
+                n_pos = mask.sum().item()
+                stats[f"{name}/n_positions"] = n_pos
+                stats[f"{name}/n_positions_per_img"] = n_pos / max(B, 1)
+
+            for lvl, vq in enumerate(rq.levels):
+                w = vq.embedding.weight
+                norms = w.norm(dim=-1)
+                ema = vq.ema_count
+                stats[f"{name}/L{lvl}/norm_mean"] = norms.mean().item()
+                stats[f"{name}/L{lvl}/norm_std"] = norms.std().item()
+                stats[f"{name}/L{lvl}/dead_frac"] = (
+                    (ema < 1.0).float().mean().item()
+                )
+                stats[f"{name}/L{lvl}/ema_min"] = ema.min().item()
+                stats[f"{name}/L{lvl}/ema_max"] = ema.max().item()
+                stats[f"{name}/L{lvl}/ema_mean"] = ema.mean().item()
+
+        return stats
+
+    @torch.no_grad()
+    def print_detailed_stats(self, z=None, masks=None, images=None, prefix=""):
+        """Pretty-print get_detailed_stats() output."""
+        stats = self.get_detailed_stats(z=z, masks=masks, images=images)
+        print(f"{prefix}--- RegionAwareVQ diagnostics ---")
+        if "z_norm_mean" in stats:
+            print(f"{prefix}z_norm: mean={stats['z_norm_mean']:.2f} "
+                  f"std={stats['z_norm_std']:.2f}")
+        for name in REGION_NAMES:
+            scale = stats.get(f"{name}/codebook_scale", float('nan'))
+            n_pos = stats.get(f"{name}/n_positions", None)
+            n_per = stats.get(f"{name}/n_positions_per_img", None)
+            pos_str = (f" n_pos={n_pos} ({n_per:.1f}/img)"
+                       if n_pos is not None else "")
+            print(f"{prefix}[{name}] scale={scale:.3f}{pos_str}")
+            for lvl in range(len(self.region_codebooks[name].levels)):
+                nm = stats[f"{name}/L{lvl}/norm_mean"]
+                ns = stats[f"{name}/L{lvl}/norm_std"]
+                df = stats[f"{name}/L{lvl}/dead_frac"]
+                emi = stats[f"{name}/L{lvl}/ema_min"]
+                ema = stats[f"{name}/L{lvl}/ema_mean"]
+                print(f"{prefix}  L{lvl}: "
+                      f"norm={nm:.3f}±{ns:.3f}  "
+                      f"dead={df*100:.0f}%  "
+                      f"ema[min/mean]={emi:.2f}/{ema:.2f}")
+        print(f"{prefix}" + "-" * 34)
 
     @torch.no_grad()
     def get_codebook_stats(self):

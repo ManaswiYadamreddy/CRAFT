@@ -9,19 +9,20 @@ The BiSeNet architecture is included inline so there's no external dependency
 on the face-parsing repo. You only need to download the pretrained checkpoint:
 
 
-CelebAMask-HQ 19-class label indices:
+CelebAMask-HQ 19-class label indices (as used by zllrunning/face-parsing.PyTorch,
+which is the source of the 79999_iter.pth checkpoint we load):
     0:  background      1:  skin          2:  l_brow        3:  r_brow
     4:  l_eye           5:  r_eye         6:  eye_g         7:  l_ear
-    8:  r_ear           9:  nose         10:  mouth        11:  u_lip
-    12: l_lip          13:  hair         14:  hat          15:  ear_r
-    16: neck_l         17:  neck         18:  cloth
+    8:  r_ear           9:  ear_r        10:  nose         11:  mouth
+    12: u_lip          13:  l_lip        14:  neck         15:  neck_l
+    16: cloth          17:  hair         18:  hat
 
 CRAFT 5-region mapping:
-    eyes:  l_eye(4), r_eye(5), l_brow(2), r_brow(3), eye_g(6)
-    skin:  skin(1), nose(9), l_ear(7), r_ear(8), neck(17)
-    hair:  hair(13), hat(14)
-    lips:  u_lip(11), l_lip(12), mouth(10)
-    bg:    background(0), cloth(18), ear_r(15), neck_l(16)
+    eyes:  l_brow(2), r_brow(3), l_eye(4), r_eye(5), eye_g(6)
+    skin:  skin(1), l_ear(7), r_ear(8), nose(10), neck(14)
+    hair:  hair(17), hat(18)
+    lips:  mouth(11), u_lip(12), l_lip(13)
+    bg:    background(0), ear_r(9), neck_l(15), cloth(16)
 
 Region indices in REGION_NAMES order are used as priority ranks in the
 any-hit downsample: a latent cell gets the highest-priority (rarest)
@@ -225,10 +226,10 @@ class BiSeNet(nn.Module):
 # dedicated `bg` region so they don't contaminate the skin codebook.
 REGION_MAP = {
     "eyes": [2, 3, 4, 5, 6],        # l_brow, r_brow, l_eye, r_eye, eye_g
-    "skin": [1, 7, 8, 9, 17],       # skin, l_ear, r_ear, nose, neck
-    "hair": [13, 14],               # hair, hat
-    "lips": [10, 11, 12],           # mouth, u_lip, l_lip
-    "bg":   [0, 15, 16, 18],        # background, ear_r, neck_l, cloth
+    "skin": [1, 7, 8, 10, 14],      # skin, l_ear, r_ear, nose, neck
+    "hair": [17, 18],               # hair, hat
+    "lips": [11, 12, 13],           # mouth, u_lip, l_lip
+    "bg":   [0, 9, 15, 16],         # background, ear_r, neck_l, cloth
 }
 
 # Ordered region names. The old 4 names keep their old indices so any

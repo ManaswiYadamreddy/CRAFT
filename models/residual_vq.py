@@ -114,8 +114,14 @@ class VQLevel(nn.Module):
             * n
         )
         updated = self.ema_weight / count_smoothed.unsqueeze(1)
-        # Re-normalize codebook to unit sphere after EMA update
-        self.embedding.weight.data.copy_(F.normalize(updated, dim=1))
+        new_weight = F.normalize(updated, dim=1)
+
+        # Underflow guard: see GlobalVQ._ema_update for the full explanation.
+        # ema_weight*decay**k underflows to 0 in fp32 after ~2000 non-selection
+        # steps; F.normalize(0)=0 would create a permanently-dead zero row.
+        alive = new_weight.norm(dim=1) > 1e-3
+        self.embedding.weight.data[alive] = new_weight[alive]
+        self.ema_weight.data[~alive] = self.embedding.weight.data[~alive]
 
     @torch.no_grad()
     def _expire_dead_codes(self, z_flat, indices, threshold=1.0):

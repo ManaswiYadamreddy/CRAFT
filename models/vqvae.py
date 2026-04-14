@@ -440,8 +440,49 @@ class GlobalVQ(nn.Module):
         n = self.ema_count.sum()
         count_smoothed = (self.ema_count + 1e-5) / (n + self.n_codes * 1e-5) * n
         updated = self.ema_weight / count_smoothed.unsqueeze(1)
-        # Re-normalize codebook to unit sphere after EMA update
-        self.embedding.weight.data.copy_(F.normalize(updated, dim=1))
+        new_weight = F.normalize(updated, dim=1)
+
+        # Underflow guard: ema_weight*decay**k underflows to exactly 0 in fp32
+        # around k≈2000 non-selection steps. F.normalize(0) returns 0, which
+        # would bake a permanently-dead zero row into the embedding and
+        # cosine-sim argmax would never choose it again. Preserve the old
+        # (still unit-norm) row for any code whose update collapsed.
+        alive = new_weight.norm(dim=1) > 1e-3
+        self.embedding.weight.data[alive] = new_weight[alive]
+        # Resurrect ema_weight too, so next step starts from a real vector.
+        self.ema_weight.data[~alive] = self.embedding.weight.data[~alive]
+
+    @torch.no_grad()
+    def expire_dead_codes(self, z, images=None, masks=None, threshold=1.0):
+        """
+        Replace codebook rows with EMA count below `threshold` by randomly
+        sampled normalized encoder outputs. Called by the train loop on the
+        `expire_every` schedule. Signature matches RegionAwareVQ so the
+        train loop can call it through the same hook.
+
+        Returns the number of codes replaced (int).
+        """
+        B, C, H, W = z.shape
+        z_flat = z.float().permute(0, 2, 3, 1).reshape(-1, C)
+        z_normed = F.normalize(z_flat, dim=1)
+
+        dead_mask = self.ema_count < threshold
+        n_dead = int(dead_mask.sum().item())
+        if n_dead == 0 or z_normed.shape[0] == 0:
+            return 0
+
+        perm = torch.randint(0, z_normed.shape[0], (n_dead,),
+                             device=z_normed.device)
+        replacements = z_normed[perm]
+
+        # DDP: broadcast from rank 0 so all ranks end up with identical codes.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(replacements, src=0)
+
+        self.embedding.weight.data[dead_mask] = replacements
+        self.ema_weight.data[dead_mask] = replacements
+        self.ema_count[dead_mask] = 1.0
+        return n_dead
 
     def forward(self, z, images=None, masks=None):
         """

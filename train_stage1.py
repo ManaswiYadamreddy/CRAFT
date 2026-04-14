@@ -418,7 +418,10 @@ def run_phase_a(args, device):
             scaler_g.load_state_dict(ckpt["scaler_g"])
         if scaler_d is not None and "scaler_d" in ckpt:
             scaler_d.load_state_dict(ckpt["scaler_d"])
+        history = ckpt.get("history", [])
         print(f"Resumed from epoch {start_epoch}")
+    else:
+        history = []
 
     # Training loop
     ckpt = None
@@ -448,6 +451,12 @@ def run_phase_a(args, device):
         print(f"Phase A | Epoch {epoch} done in {elapsed:.0f}s | "
               f"L1={avg_logs.get('l1',0):.4f} VQ={avg_logs.get('vq',0):.4f}")
 
+        # Append this epoch's averaged logs to history (for diagnose_phase_a)
+        history.append({"epoch": epoch, **{
+            k: float(v) for k, v in avg_logs.items()
+            if isinstance(v, (int, float))
+        }})
+
         # Save checkpoint
         ckpt = {
             "epoch": epoch,
@@ -455,6 +464,7 @@ def run_phase_a(args, device):
             "discriminator": criterion.discriminator.state_dict(),
             "optimizer_g": optimizer_g.state_dict(),
             "optimizer_d": optimizer_d.state_dict(),
+            "history": history,
         }
         if scheduler_g:
             ckpt["scheduler_g"] = scheduler_g.state_dict()

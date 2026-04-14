@@ -56,19 +56,19 @@ CRAFT Stage 1 has three phases:
 
 ```bash
 # Phase A only (HQ pretraining)
-python PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True train_stage1.py --config configs/train.yaml --phase A
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_stage1.py --config configs/train.yaml --phase A
 
 # Phase B only (needs Phase A checkpoint)
-python PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True train_stage1.py --config configs/train.yaml --phase B \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_stage1.py --config configs/train.yaml --phase B \
     --hq_ckpt checkpoints/phase_a/final.pt
 
 # Phase C only (needs both checkpoints)
-python PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True train_stage1.py --config configs/train.yaml --phase C \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_stage1.py --config configs/train.yaml --phase C \
     --hq_ckpt checkpoints/phase_a/final.pt \
     --lq_ckpt checkpoints/phase_b/final.pt
 
 # All three phases sequentially
-python PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True train_stage1.py --config configs/train.yaml --phase all
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_stage1.py --config configs/train.yaml --phase all
 ```
 
 ## Training OSDFace Stage 1 (VRE)
@@ -92,7 +92,7 @@ Phase B/C.
 ### Default run (recommended)
 
 ```bash
-python PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True train_osdface_stage1.py --config configs/train_osdface.yaml
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_osdface_stage1.py --config configs/train_osdface.yaml
 ```
 
 This picks up `hq_ckpt` and `freeze_hq: true` from the config file.

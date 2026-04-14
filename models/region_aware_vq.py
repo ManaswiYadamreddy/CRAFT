@@ -35,10 +35,13 @@ class RegionAwareVQ(nn.Module):
     BiSeNet face parser, then quantizes each region with its own dedicated 
     3-level ResidualVQ codebook.
     
-    Codebook sizes are proportional to the number of spatial positions each 
+    Codebook sizes are proportional to the number of spatial positions each
     region typically receives (balances expressiveness vs. collapse risk):
         hair: 512 codes  (80-120 positions/image, high texture variety)
         skin: 256 codes  (60-100 positions/image, low texture variety)
+        bg:   256 codes  (40-80 positions/image, background/cloth/jewellery —
+                         split out from skin so the skin codebook is not
+                         contaminated with non-face texture)
         eyes: 128 codes  (10-20 positions/image, high variety but few positions)
         lips:  64 codes  (5-10 positions/image, collapse-prone with larger codebooks)
     
@@ -60,6 +63,7 @@ class RegionAwareVQ(nn.Module):
         "skin": 256,
         "hair": 512,
         "lips": 64,
+        "bg":   256,
     }
 
     def __init__(

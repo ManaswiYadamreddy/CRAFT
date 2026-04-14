@@ -39,20 +39,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 
-from models.face_parser import FaceParser, REGION_NAMES, REGION_MAP, N_CLASSES
+from models.face_parser import (
+    FaceParser, REGION_NAMES, REGION_MAP, N_CLASSES, ANY_HIT_PRIORITY,
+)
 
 
-# Priority order for any-hit downsample: rarest regions win ties.
-# eyes=0, lips=3, hair=2, skin=1 in REGION_NAMES; we encode priority
-# as a rank so that lower rank = higher priority.
-ANY_HIT_PRIORITY = ["eyes", "lips", "hair", "skin"]
-
-# Fixed colors for the 4 regions (RGBA)
+# Fixed colors for each region (RGBA). Hair uses a bright teal so it is
+# actually visible in the overlay — the old dark-gray-at-alpha=0.45 was
+# blending into dark hair and looked like "no overlay".
 REGION_COLORS = {
-    "eyes": (1.0, 0.2, 0.2, 1.0),   # red
-    "skin": (1.0, 0.85, 0.7, 1.0),  # tan
-    "hair": (0.3, 0.3, 0.3, 1.0),   # dark gray
-    "lips": (0.9, 0.3, 0.8, 1.0),   # magenta
+    "eyes": (1.0, 0.2, 0.2, 1.0),    # red
+    "skin": (1.0, 0.85, 0.7, 1.0),   # tan
+    "hair": (0.1, 0.8, 0.8, 1.0),    # teal
+    "lips": (0.9, 0.3, 0.8, 1.0),    # magenta
+    "bg":   (0.2, 0.2, 0.9, 1.0),    # blue
 }
 
 
@@ -62,45 +62,21 @@ def build_region_cmap():
     return ListedColormap(colors)
 
 
-def any_hit_downsample(region_indices_full, target_h, target_w):
+def any_hit_downsample(parser, region_indices_full, target_h, target_w):
     """
-    Downsample a (B, H, W) region-index map to (B, target_h, target_w)
-    using priority-based any-hit pooling instead of nearest-neighbor.
-
-    If any pixel in the pooling window belongs to a higher-priority
-    region, the target cell gets that region.
-
-    Args:
-        region_indices_full: (B, H, W) int64 in {0..3}, REGION_NAMES order.
-    Returns:
-        (B, target_h, target_w) int64 in {0..3}.
+    Thin wrapper around FaceParser._any_hit_downsample. Kept in this
+    script only for comparison against the old nearest-neighbor path.
     """
-    B, H, W = region_indices_full.shape
-    # Map region index -> priority rank (0 = highest priority)
-    idx_to_priority = torch.zeros(len(REGION_NAMES), dtype=torch.long,
-                                  device=region_indices_full.device)
-    for rank, name in enumerate(ANY_HIT_PRIORITY):
-        idx_to_priority[REGION_NAMES.index(name)] = rank
+    return parser._any_hit_downsample(region_indices_full, target_h, target_w)
 
-    priority_map = idx_to_priority[region_indices_full]  # (B, H, W), lower=better
 
-    # Min-pool priority over each (H/target_h, W/target_w) window.
-    # Use -max-pool on negated values because PyTorch has no min_pool.
-    kh, kw = H // target_h, W // target_w
-    assert H % target_h == 0 and W % target_w == 0, \
-        f"Full res ({H}x{W}) must be divisible by target ({target_h}x{target_w})"
-
-    neg = (-priority_map.float()).unsqueeze(1)  # (B, 1, H, W)
-    pooled_neg = F.max_pool2d(neg, kernel_size=(kh, kw), stride=(kh, kw))
-    best_priority = (-pooled_neg).squeeze(1).long()  # (B, target_h, target_w)
-
-    # Map priority rank back to region index.
-    priority_to_idx = torch.zeros(len(REGION_NAMES), dtype=torch.long,
-                                  device=region_indices_full.device)
-    for rank, name in enumerate(ANY_HIT_PRIORITY):
-        priority_to_idx[rank] = REGION_NAMES.index(name)
-
-    return priority_to_idx[best_priority]
+def nearest_downsample(region_indices_full, target_h, target_w):
+    """The old broken path — stride-N point sampling. Kept for comparison."""
+    return F.interpolate(
+        region_indices_full.unsqueeze(1).float(),
+        size=(target_h, target_w),
+        mode="nearest",
+    ).squeeze(1).long()
 
 
 def compute_region_indices_full(parser, images):
@@ -242,15 +218,13 @@ def main():
 
         region_full = compute_region_indices_full(parser, images)  # (B, 512, 512)
 
-        # Current: nearest-neighbor (exactly what the parser currently does)
-        region_cur = F.interpolate(
-            region_full.unsqueeze(1).float(),
-            size=(args.target_h, args.target_w),
-            mode="nearest",
-        ).squeeze(1).long()                                     # (B, h, w)
+        # "Current" = old nearest-neighbor path, kept here purely so this
+        # script stays useful as a before/after comparison even after
+        # face_parser.py is patched to use any-hit.
+        region_cur = nearest_downsample(region_full, args.target_h, args.target_w)
 
-        # Proposed: priority any-hit
-        region_any = any_hit_downsample(region_full, args.target_h, args.target_w)
+        # Proposed / now-live path: priority any-hit from FaceParser itself.
+        region_any = any_hit_downsample(parser, region_full, args.target_h, args.target_w)
 
         # [1] per-image latent-token counts
         for r in range(R):

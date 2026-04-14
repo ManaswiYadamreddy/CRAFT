@@ -458,7 +458,7 @@ class ResidualVQ(nn.Module):
 # ======================================================================
 
 def build_region_rq_vae(
-    n_regions=4,
+    n_regions=None,
     n_codes=256,
     e_dim=512,
     n_levels=3,
@@ -468,15 +468,17 @@ def build_region_rq_vae(
 ):
     """
     Build a set of ResidualVQ instances, one per facial region.
-    
+
     Args:
-        n_regions: Number of facial regions (default: 4 — eyes, skin, hair, lips).
+        n_regions: If None, uses all regions from face_parser.REGION_NAMES.
+                   Otherwise truncates to the first n_regions.
         (other args forwarded to ResidualVQ)
-    
+
     Returns:
         nn.ModuleDict mapping region name → ResidualVQ.
     """
-    region_names = ["eyes", "skin", "hair", "lips"][:n_regions]
+    from .face_parser import REGION_NAMES
+    region_names = REGION_NAMES if n_regions is None else REGION_NAMES[:n_regions]
     return nn.ModuleDict(
         {
             name: ResidualVQ(

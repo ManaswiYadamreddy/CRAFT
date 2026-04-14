@@ -16,12 +16,21 @@ CelebAMask-HQ 19-class label indices:
     12: l_lip          13:  hair         14:  hat          15:  ear_r
     16: neck_l         17:  neck         18:  cloth
 
-CRAFT 4-region mapping:
+CRAFT 5-region mapping:
     eyes:  l_eye(4), r_eye(5), l_brow(2), r_brow(3), eye_g(6)
-    skin:  skin(1), nose(9), l_ear(7), r_ear(8), neck(17),
-           ear_r(15), neck_l(16), background(0), cloth(18)
+    skin:  skin(1), nose(9), l_ear(7), r_ear(8), neck(17)
     hair:  hair(13), hat(14)
     lips:  u_lip(11), l_lip(12), mouth(10)
+    bg:    background(0), cloth(18), ear_r(15), neck_l(16)
+
+Region indices in REGION_NAMES order are used as priority ranks in the
+any-hit downsample: a latent cell gets the highest-priority (rarest)
+region that has *any* pixel inside it. Priority order:
+
+    eyes (0) > lips (3) > hair (2) > skin (1) > bg (4)
+
+so eyes always win ties, bg only wins if a latent cell is entirely
+background/cloth/jewellery.
 """
 
 import torch
@@ -212,15 +221,25 @@ class BiSeNet(nn.Module):
 # ======================================================================
 
 # CelebAMask-HQ label indices → CRAFT region assignment
+# NOTE: background / cloth / earring / necklace are split out into a
+# dedicated `bg` region so they don't contaminate the skin codebook.
 REGION_MAP = {
-    "eyes": [2, 3, 4, 5, 6],      # l_brow, r_brow, l_eye, r_eye, eye_g
-    "skin": [0, 1, 7, 8, 9, 15, 16, 17, 18],  # bg, skin, ears, nose, neck, earring, necklace, cloth
+    "eyes": [2, 3, 4, 5, 6],        # l_brow, r_brow, l_eye, r_eye, eye_g
+    "skin": [1, 7, 8, 9, 17],       # skin, l_ear, r_ear, nose, neck
     "hair": [13, 14],               # hair, hat
     "lips": [10, 11, 12],           # mouth, u_lip, l_lip
+    "bg":   [0, 15, 16, 18],        # background, ear_r, neck_l, cloth
 }
 
-# Ordered region names (consistent with residual_vq.py)
-REGION_NAMES = ["eyes", "skin", "hair", "lips"]
+# Ordered region names. The old 4 names keep their old indices so any
+# downstream code that hard-codes "eyes=0, skin=1, hair=2, lips=3" still
+# works; bg is appended as index 4.
+REGION_NAMES = ["eyes", "skin", "hair", "lips", "bg"]
+
+# Any-hit priority: lower rank wins ties. Rare semantic regions must not
+# be stolen by common ones, and bg must lose to everything.
+#   eyes > lips > hair > skin > bg
+ANY_HIT_PRIORITY = ["eyes", "lips", "hair", "skin", "bg"]
 
 # Number of CelebAMask-HQ classes
 N_CLASSES = 19
@@ -264,13 +283,25 @@ class FaceParser(nn.Module):
         for p in self.parameters():
             p.requires_grad_(False)
 
-        # Precompute label→region index lookup table for fast mapping
-        # region_lut[label_id] = region_index (0=eyes, 1=skin, 2=hair, 3=lips)
+        # Precompute label→region index lookup table for fast mapping.
+        # region_lut[label_id] = region_index per REGION_NAMES order
+        # (0=eyes, 1=skin, 2=hair, 3=lips, 4=bg).
         lut = torch.zeros(N_CLASSES, dtype=torch.long)
         for region_idx, name in enumerate(REGION_NAMES):
             for label_id in REGION_MAP[name]:
                 lut[label_id] = region_idx
         self.register_buffer("region_lut", lut)
+
+        # Precompute region_index -> priority rank (low=wins ties) for
+        # the any-hit downsample. Built from ANY_HIT_PRIORITY.
+        idx_to_priority = torch.zeros(len(REGION_NAMES), dtype=torch.long)
+        for rank, name in enumerate(ANY_HIT_PRIORITY):
+            idx_to_priority[REGION_NAMES.index(name)] = rank
+        self.register_buffer("idx_to_priority", idx_to_priority)
+        priority_to_idx = torch.zeros(len(REGION_NAMES), dtype=torch.long)
+        for rank, name in enumerate(ANY_HIT_PRIORITY):
+            priority_to_idx[rank] = REGION_NAMES.index(name)
+        self.register_buffer("priority_to_idx", priority_to_idx)
 
         # ImageNet normalization (BiSeNet expects this)
         self.register_buffer(
@@ -316,6 +347,40 @@ class FaceParser(nn.Module):
         return labels
 
     @torch.no_grad()
+    def _any_hit_downsample(self, region_indices_full, target_h, target_w):
+        """
+        Priority-based any-hit pooling from full-resolution region indices
+        to (target_h, target_w).
+
+        For each output cell, returns the *highest-priority* (rarest) region
+        that has at least one pixel inside the pooling window. Replaces the
+        old nearest-neighbor `F.interpolate(..., mode="nearest")` which was
+        stride-N point sampling and systematically dropped small regions
+        like eyes/lips.
+
+        Args:
+            region_indices_full: (B, H, W) int64 in [0, n_regions).
+            target_h, target_w:  output spatial size; must divide H, W.
+
+        Returns:
+            (B, target_h, target_w) int64 region indices.
+        """
+        B, H, W = region_indices_full.shape
+        assert H % target_h == 0 and W % target_w == 0, (
+            f"Full res ({H}x{W}) must be divisible by target "
+            f"({target_h}x{target_w}) for any-hit pooling"
+        )
+        kh, kw = H // target_h, W // target_w
+
+        # Map region index -> priority rank (low=wins), then min-pool via
+        # -max-pool on negated values (PyTorch has no min_pool2d).
+        priority_map = self.idx_to_priority[region_indices_full]  # (B, H, W)
+        neg = (-priority_map.float()).unsqueeze(1)                # (B, 1, H, W)
+        pooled = F.max_pool2d(neg, kernel_size=(kh, kw), stride=(kh, kw))
+        best_priority = (-pooled).squeeze(1).long()               # (B, th, tw)
+        return self.priority_to_idx[best_priority]                # (B, th, tw)
+
+    @torch.no_grad()
     def get_region_masks(self, images, target_h=16, target_w=16):
         """
         Produce 4-region binary masks at the target spatial resolution.
@@ -334,19 +399,13 @@ class FaceParser(nn.Module):
                    Every spatial position is assigned to exactly one region 
                    (masks are mutually exclusive and collectively exhaustive).
         """
-        # Get full-resolution labels
-        labels = self.parse(images)  # (B, 512, 512)
+        # Get full-resolution labels and map to region indices
+        labels = self.parse(images)               # (B, 512, 512)
+        region_full = self.region_lut[labels]     # (B, 512, 512) in {0..R-1}
 
-        # Map labels to region indices using the lookup table
-        region_indices = self.region_lut[labels]  # (B, 512, 512) values in {0,1,2,3}
-
-        # Downsample to target resolution using nearest-neighbor
-        # (preserves discrete labels, no interpolation artifacts)
-        region_indices = F.interpolate(
-            region_indices.unsqueeze(1).float(),
-            size=(target_h, target_w),
-            mode="nearest",
-        ).squeeze(1).long()  # (B, target_h, target_w)
+        # Priority-based any-hit downsample (see _any_hit_downsample docstring
+        # for why this replaced the old nearest-neighbor interpolate).
+        region_indices = self._any_hit_downsample(region_full, target_h, target_w)
 
         # Create per-region binary masks
         masks = {}
@@ -370,13 +429,8 @@ class FaceParser(nn.Module):
                             Values: 0=eyes, 1=skin, 2=hair, 3=lips.
         """
         labels = self.parse(images)
-        region_indices = self.region_lut[labels]
-        region_indices = F.interpolate(
-            region_indices.unsqueeze(1).float(),
-            size=(target_h, target_w),
-            mode="nearest",
-        ).squeeze(1).long()
-        return region_indices
+        region_full = self.region_lut[labels]
+        return self._any_hit_downsample(region_full, target_h, target_w)
 
     # ------------------------------------------------------------------
     # Diagnostic / visualization

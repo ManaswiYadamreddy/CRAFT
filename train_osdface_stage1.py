@@ -166,7 +166,7 @@ def train_one_epoch(
 
         with autocast("cuda", enabled=use_amp):
             # LQ branch (the one being trained)
-            x_l_rec, z_l, z_l_q, vq_losses_l, _ = lq_model(
+            x_l_rec, z_l, z_l_q, vq_losses_l, vq_info_l = lq_model(
                 x_l, images_01=x_l01, masks=None,
             )
             gen_loss, gen_logs = criterion.generator_loss(
@@ -206,10 +206,16 @@ def train_one_epoch(
             if grad_clip_norm > 0:
                 if scaler_g is not None:
                     scaler_g.unscale_(optimizer_g)
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in lq_model.parameters() if p.requires_grad],
                     max_norm=grad_clip_norm,
                 )
+                accum.setdefault("grad_norm_sum", 0.0)
+                accum.setdefault("grad_norm_count", 0)
+                gn = grad_norm.item()
+                if not (math.isnan(gn) or math.isinf(gn)):
+                    accum["grad_norm_sum"] += gn
+                    accum["grad_norm_count"] += 1
             if scaler_g is not None:
                 scaler_g.step(optimizer_g)
                 scaler_g.update()
@@ -246,7 +252,13 @@ def train_one_epoch(
 
         if is_accum_step:
             d_logs = {}
-        all_logs = {**gen_logs, **d_logs, "assoc": l_assoc.detach()}
+        all_logs = {**gen_logs, **d_logs}
+        if lambda_assoc > 0:
+            all_logs["association"] = l_assoc.detach()
+        # VQ monitoring info (z_norm, codebook_norm, codebook_scale) — match CRAFT
+        for k, v in vq_info_l.items():
+            if torch.is_tensor(v) and v.ndim == 0:
+                all_logs[k] = v
         for k, v in all_logs.items():
             val = v.item() if torch.is_tensor(v) else v
             if not (math.isnan(val) or math.isinf(val)):
@@ -255,9 +267,18 @@ def train_one_epoch(
 
         if (step + 1) % log_every == 0:
             msg = f"  OSDFace S1 Phase {phase} | Epoch {epoch} | Step {step+1}/{len(loader)}"
-            for k in ["l1", "perceptual", "gan_g", "vq", "gan_d", "assoc"]:
+            for k in ["total_gen", "l1", "perceptual", "gan_g", "vq", "gan_d"]:
                 if k in accum:
                     msg += f" | {k}: {accum[k]/n_steps:.4f}"
+            if "association" in accum:
+                msg += f" | assoc: {accum['association']/n_steps:.4f}"
+            if accum.get("grad_norm_count", 0) > 0:
+                avg_gn = accum["grad_norm_sum"] / accum["grad_norm_count"]
+                msg += f" | gnorm: {avg_gn:.2f}"
+            if "z_norm" in accum:
+                msg += f" | z: {accum['z_norm']/n_steps:.1f}"
+            if "codebook_norm" in accum:
+                msg += f" | cb: {accum['codebook_norm']/n_steps:.1f}"
             if nan_steps > 0:
                 msg += f" | nan_skips: {nan_steps}"
             print(msg)
@@ -467,7 +488,7 @@ def run_phase_a(args, device):
                 optimizer_g.zero_grad()
 
             with autocast("cuda", enabled=use_amp):
-                x_rec, z, z_q, vq_losses, _ = hq_model(x, images_01=x01, masks=None)
+                x_rec, z, z_q, vq_losses, vq_info = hq_model(x, images_01=x01, masks=None)
                 gen_loss, gen_logs = criterion.generator_loss(
                     x_rec, x, vq_losses["total_vq"],
                 )
@@ -492,9 +513,15 @@ def run_phase_a(args, device):
                 if args.grad_clip_norm > 0:
                     if scaler_g is not None:
                         scaler_g.unscale_(optimizer_g)
-                    torch.nn.utils.clip_grad_norm_(
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         hq_model.parameters(), max_norm=args.grad_clip_norm,
                     )
+                    accum.setdefault("grad_norm_sum", 0.0)
+                    accum.setdefault("grad_norm_count", 0)
+                    gn = grad_norm.item()
+                    if not (math.isnan(gn) or math.isinf(gn)):
+                        accum["grad_norm_sum"] += gn
+                        accum["grad_norm_count"] += 1
                 if scaler_g is not None:
                     scaler_g.step(optimizer_g)
                     scaler_g.update()
@@ -530,7 +557,11 @@ def run_phase_a(args, device):
 
             if is_accum_step:
                 d_logs = {}
-            for k, v in {**gen_logs, **d_logs}.items():
+            all_logs = {**gen_logs, **d_logs}
+            for k, v in vq_info.items():
+                if torch.is_tensor(v) and v.ndim == 0:
+                    all_logs[k] = v
+            for k, v in all_logs.items():
                 val = v.item() if torch.is_tensor(v) else v
                 if not (math.isnan(val) or math.isinf(val)):
                     accum[k] += val
@@ -538,9 +569,16 @@ def run_phase_a(args, device):
 
             if (step + 1) % args.log_every == 0:
                 msg = f"  OSDFace S1 Phase A | Epoch {epoch} | Step {step+1}/{len(loader)}"
-                for k in ["l1", "perceptual", "gan_g", "vq", "gan_d"]:
+                for k in ["total_gen", "l1", "perceptual", "gan_g", "vq", "gan_d"]:
                     if k in accum:
                         msg += f" | {k}: {accum[k]/n_steps:.4f}"
+                if accum.get("grad_norm_count", 0) > 0:
+                    avg_gn = accum["grad_norm_sum"] / accum["grad_norm_count"]
+                    msg += f" | gnorm: {avg_gn:.2f}"
+                if "z_norm" in accum:
+                    msg += f" | z: {accum['z_norm']/n_steps:.1f}"
+                if "codebook_norm" in accum:
+                    msg += f" | cb: {accum['codebook_norm']/n_steps:.1f}"
                 if nan_steps > 0:
                     msg += f" | nan_skips: {nan_steps}"
                 print(msg)

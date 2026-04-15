@@ -1,17 +1,27 @@
 # OSDFace Stage 1 (VRE) — Training configuration
 #
-# Trains two flat VQ-VAEs (HQ branch + LQ branch) jointly with an
-# HQ↔LQ feature association loss (OSDFace Eq. 9–10).
+# Mirrors the OSDFace paper (§3.2): the HQ VQ-VAE is trained for 50 epochs,
+# then the LQ VQ-VAE is trained for 10 epochs with lambda_assoc=0, followed
+# by an additional 10 epochs with lambda_assoc=1. HQ is frozen during the
+# LQ phases.
 #
-# NOTE: To stay comparable with CRAFT, this setup uses the same unit-sphere
-# codebook + cosine similarity quantizer (GlobalVQ) that CRAFT uses, instead
-# of the raw-space L2 quantizer described in the original OSDFace paper.
+# We reuse CRAFT's Phase A checkpoint as the HQ branch (it is the same
+# MultiHeadEncoder/Decoder + GlobalVQ that OSDFace Stage 1's HQ branch is
+# in this codebase), so only the LQ branch needs to be trained here.
+#
+# To stay comparable with CRAFT, both codebooks live on the unit hypersphere
+# and quantize via cosine similarity (CRAFT's GlobalVQ), instead of the
+# raw-space L2 quantizer described in the original paper.
 #
 # Usage:
-#   python train_osdface_stage1.py --config configs/train_osdface.yaml
-#   # Warm-start HQ branch from a CRAFT Phase A checkpoint (recommended):
-#   python train_osdface_stage1.py --config configs/train_osdface.yaml \
-#       --hq_ckpt /path/to/checkpoints/phase_a/final.pt --freeze_hq
+#   # Phases B and C sequentially (10 + 10 epochs)
+#   python train_osdface_stage1.py --config configs/train_osdface.yaml --phase all
+#
+#   # Phase B only
+#   python train_osdface_stage1.py --config configs/train_osdface.yaml --phase B
+#
+#   # Phase C only (continues from Phase B checkpoint)
+#   python train_osdface_stage1.py --config configs/train_osdface.yaml --phase C
 
 # Data
 data_root: /projectnb/cs585/projects/craft/data/train
@@ -28,18 +38,21 @@ lr: 1.44e-4
 lr_schedule: cosine
 warmup_epochs: 2
 grad_clip_norm: 1.0
-epochs: 50                 # Stage 1 total epochs (paper: 50)
+
+# Phase epochs (paper: 50 + 10 + 10)
+hq_epochs: 50           # Phase A  (HQ self-recon, only used by --phase A)
+lq_epochs: 10           # Phase B  (lambda_assoc = 0)
+assoc_epochs: 10        # Phase C  (lambda_assoc = 1)
 
 # Loss weights (OSDFace Eq. 8, 11)
 lambda_per: 1.0
 lambda_dis: 0.8
 lambda_assoc: 1.0
-assoc_warmup_epochs: 5     # keep lambda_assoc=0 for first N epochs
 gan_warmup_epochs: 2
 
-# HQ branch init / freezing
-hq_ckpt: "/projectnb/cs585/projects/craft/checkpoints/phase_a/final.pt"                # optional: CRAFT Phase A checkpoint to warm-start HQ
-freeze_hq: true            # HQ branch frozen by default — reuses CRAFT Phase A
+# HQ branch (always frozen; reuses CRAFT Phase A final.pt)
+hq_ckpt: /projectnb/cs585/projects/craft/checkpoints/phase_a/final.pt
+lq_ckpt: ""             # Phase B checkpoint, used by Phase C
 
 # Checkpointing
 ckpt_dir: /projectnb/cs585/projects/craft/checkpoints_osdface

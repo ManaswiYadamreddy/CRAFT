@@ -1,34 +1,41 @@
 """
 train_osdface_stage1.py — OSDFace Stage 1 (VRE) training.
 
-Reproduces OSDFace's Stage 1 — Visual Representation Embedder (VRE) — as a
-baseline to compare against CRAFT. It trains two flat VQ-VAEs in parallel:
+Reproduces OSDFace's Stage 1 — Visual Representation Embedder — as a baseline
+to compare against CRAFT, in three phases that mirror the OSDFace paper §3.2:
 
-    HQ branch:  E_H → quant_conv → Q_H (HQ Dict) → post_quant_conv → D_H → I_H
-    LQ branch:  E_L → quant_conv → Q_L (LQ Dict) → post_quant_conv → D_L → I_L
+    HQ phase (50 epochs, λ_assoc n/a):
+        Train the HQ VQ-VAE on HQ self-reconstruction.
+        --> REUSED FROM CRAFT PHASE A. We do not retrain it here. The HQ
+            branch is loaded from `hq_ckpt` and frozen.
 
-and aligns their encoder feature spaces via the HQ↔LQ association loss
-(OSDFace Eq. 9–10).
+    Phase B (10 epochs, λ_assoc = 0):
+        Train the LQ VQ-VAE on LQ self-reconstruction. HQ is frozen.
 
-Differences from the paper — intentional, for apples-to-apples comparison
+    Phase C (10 epochs, λ_assoc = 1):
+        Continue training the LQ VQ-VAE with the HQ↔LQ feature association
+        loss (OSDFace Eq. 9–10) enabled. HQ is still frozen.
+
+Differences from the paper, intentional, for apples-to-apples comparison
 with CRAFT:
 
     * Codebooks live on the unit hypersphere and quantization uses cosine
-      similarity (CRAFT's `GlobalVQ`), not raw-space L2 as in the paper.
+      similarity (CRAFT's `GlobalVQ`), not raw-space L2.
     * Otherwise the architecture, losses, and schedule match OSDFace Stage 1.
 
-This file only touches OSDFace Stage 1. The rest of the CRAFT code (models,
+This file only adds OSDFace Stage 1. The rest of the CRAFT code (models,
 losses, dataset) is reused unchanged.
 
 Usage
 -----
-    # Train from scratch on both branches
-    python train_osdface_stage1.py --config configs/train_osdface.yaml
+    # Phases B and C sequentially (10 + 10 epochs)
+    python train_osdface_stage1.py --config configs/train_osdface.yaml --phase all
 
-    # Warm-start HQ branch from an already trained CRAFT Phase A checkpoint
-    # (recommended — see README). Optionally freeze HQ to save compute.
-    python train_osdface_stage1.py --config configs/train_osdface.yaml \
-        --hq_ckpt checkpoints/phase_a/final.pt --freeze_hq
+    # Phase B only
+    python train_osdface_stage1.py --config configs/train_osdface.yaml --phase B
+
+    # Phase C only (continues from Phase B checkpoint written by --phase B)
+    python train_osdface_stage1.py --config configs/train_osdface.yaml --phase C
 """
 
 import argparse
@@ -52,7 +59,7 @@ from losses.losses import Stage1VQLoss, AssociationLoss
 
 
 # ======================================================================
-# Helpers (mirror train_stage1.py)
+# Helpers
 # ======================================================================
 
 def _build_scheduler(optimizer, args, total_epochs):
@@ -82,20 +89,43 @@ def _enable_gradient_checkpointing(model):
 
 
 def _features_flat(z):
-    """(B, C, H, W) → (B, H*W, C)"""
+    """(B, C, H, W) -> (B, H*W, C)"""
     B, C, H, W = z.shape
     return z.permute(0, 2, 3, 1).reshape(B, H * W, C)
 
 
+def _load_frozen_hq(args, device):
+    """Build a fresh HQ VQ-VAE and load CRAFT Phase A weights into it.
+
+    The HQ branch is identical to CRAFT Phase A (`build_hq_vqvae` factory),
+    so the state-dict keys match exactly.
+    """
+    if not args.hq_ckpt:
+        raise ValueError(
+            "OSDFace Stage 1 needs an HQ checkpoint. Set `hq_ckpt` in "
+            "configs/train_osdface.yaml or pass --hq_ckpt."
+        )
+    print(f"Loading frozen HQ branch from {args.hq_ckpt}")
+    hq_model = build_hq_vqvae(
+        n_codes=args.hq_n_codes, embed_dim=args.embed_dim,
+    ).to(device).to(memory_format=torch.channels_last)
+    ck = torch.load(args.hq_ckpt, map_location=device, weights_only=False)
+    hq_model.load_state_dict(ck["model"])
+    hq_model.eval()
+    for p in hq_model.parameters():
+        p.requires_grad_(False)
+    print("HQ branch frozen.")
+    return hq_model
+
+
 # ======================================================================
-# Training loop (joint HQ + LQ)
+# Training loop (LQ branch only; HQ frozen)
 # ======================================================================
 
 def train_one_epoch(
-    hq_model,
     lq_model,
-    criterion_h,
-    criterion_l,
+    hq_model,
+    criterion,
     assoc_loss_fn,
     lambda_assoc,
     loader,
@@ -103,7 +133,7 @@ def train_one_epoch(
     optimizer_d,
     device,
     epoch,
-    freeze_hq,
+    phase,
     expire_every=1000,
     log_every=50,
     grad_clip_norm=1.0,
@@ -112,22 +142,9 @@ def train_one_epoch(
     scaler_d=None,
     grad_accum_steps=1,
 ):
-    """
-    One OSDFace Stage 1 epoch.
-
-    For each batch we:
-      1) Forward HQ branch (self-recon of HQ image) and LQ branch (self-recon of LQ image).
-      2) Combine generator losses: L1+per+gan+vq for each branch + λ_assoc * L_assoc.
-      3) Backward through the combined generator loss once.
-      4) Alternating discriminator step on both discriminators.
-    """
-    if not freeze_hq:
-        hq_model.train()
-    else:
-        hq_model.eval()
     lq_model.train()
-    criterion_h.discriminator.train()
-    criterion_l.discriminator.train()
+    criterion.discriminator.train()
+    hq_model.eval()  # always frozen
 
     accum = defaultdict(float)
     n_steps = 0
@@ -136,9 +153,7 @@ def train_one_epoch(
     for step, batch in enumerate(loader):
         batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
                  for k, v in batch.items()}
-
         x_h = batch["hq"]
-        x_h01 = batch["hq_01"]
         x_l = batch["lq"]
         x_l01 = batch["lq_01"]
 
@@ -146,47 +161,29 @@ def train_one_epoch(
         is_first_accum = step % grad_accum_steps == 0
         loss_scale = 1.0 / grad_accum_steps
 
-        # ----- Generator step -----
         if is_first_accum:
             optimizer_g.zero_grad()
 
         with autocast("cuda", enabled=use_amp):
-            # HQ branch
-            if freeze_hq:
-                with torch.no_grad():
-                    x_h_rec, z_h, z_h_q, vq_losses_h, vq_info_h = hq_model(
-                        x_h, images_01=x_h01, masks=None,
-                    )
-                # Re-run encoder under grad=False for assoc features; z_h already detached
-                z_h_for_assoc = z_h.detach()
-                gen_loss_h = torch.zeros((), device=device)
-                gen_logs_h = {}
-            else:
-                x_h_rec, z_h, z_h_q, vq_losses_h, vq_info_h = hq_model(
-                    x_h, images_01=x_h01, masks=None,
-                )
-                gen_loss_h, gen_logs_h = criterion_h.generator_loss(
-                    x_h_rec, x_h, vq_losses_h["total_vq"],
-                )
-                z_h_for_assoc = z_h
-
-            # LQ branch
-            x_l_rec, z_l, z_l_q, vq_losses_l, vq_info_l = lq_model(
+            # LQ branch (the one being trained)
+            x_l_rec, z_l, z_l_q, vq_losses_l, _ = lq_model(
                 x_l, images_01=x_l01, masks=None,
             )
-            gen_loss_l, gen_logs_l = criterion_l.generator_loss(
+            gen_loss, gen_logs = criterion.generator_loss(
                 x_l_rec, x_l, vq_losses_l["total_vq"],
             )
 
-            # Association loss (OSDFace Eq. 9–10), λ=0 during warmup
+            # Association loss (Phase C only)
             if lambda_assoc > 0:
-                z_H_flat = _features_flat(z_h_for_assoc.float())
+                with torch.no_grad():
+                    z_h = hq_model.encode(x_h)
+                z_H_flat = _features_flat(z_h.float())
                 z_L_flat = _features_flat(z_l.float())
                 l_assoc = assoc_loss_fn(z_H_flat, z_L_flat)
+                gen_loss = gen_loss + lambda_assoc * l_assoc
             else:
                 l_assoc = torch.zeros((), device=device)
 
-            gen_loss = gen_loss_h + gen_loss_l + lambda_assoc * l_assoc
             gen_loss = gen_loss * loss_scale
 
         if torch.isnan(gen_loss) or torch.isinf(gen_loss):
@@ -209,65 +206,47 @@ def train_one_epoch(
             if grad_clip_norm > 0:
                 if scaler_g is not None:
                     scaler_g.unscale_(optimizer_g)
-                trainable = [p for p in optimizer_g.param_groups[0]["params"] if p.requires_grad]
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in lq_model.parameters() if p.requires_grad],
+                    max_norm=grad_clip_norm,
+                )
             if scaler_g is not None:
                 scaler_g.step(optimizer_g)
                 scaler_g.update()
             else:
                 optimizer_g.step()
 
-        # ----- Discriminator step (both discriminators) -----
+        # Discriminator step
         if not is_accum_step:
             optimizer_d.zero_grad()
             with autocast("cuda", enabled=use_amp):
-                d_loss_h, d_logs_h = criterion_h.discriminator_loss(x_h, x_h_rec.detach())
-                d_loss_l, d_logs_l = criterion_l.discriminator_loss(x_l, x_l_rec.detach())
-                if freeze_hq:
-                    d_loss = d_loss_l
-                else:
-                    d_loss = d_loss_h + d_loss_l
-
+                d_loss, d_logs = criterion.discriminator_loss(x_l, x_l_rec.detach())
             if scaler_d is not None:
                 scaler_d.scale(d_loss).backward()
                 scaler_d.unscale_(optimizer_d)
             else:
                 d_loss.backward()
             if grad_clip_norm > 0:
-                disc_params = list(criterion_l.discriminator.parameters())
-                if not freeze_hq:
-                    disc_params += list(criterion_h.discriminator.parameters())
-                torch.nn.utils.clip_grad_norm_(disc_params, max_norm=grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(
+                    criterion.discriminator.parameters(), max_norm=grad_clip_norm,
+                )
             if scaler_d is not None:
                 scaler_d.step(optimizer_d)
                 scaler_d.update()
             else:
                 optimizer_d.step()
 
-        # ----- Dead code expiry on both branches -----
-        if (step + 1) % expire_every == 0:
+        # Dead code expiry on LQ codebook
+        if (step + 1) % expire_every == 0 and hasattr(lq_model.quantizer, "expire_dead_codes"):
             with torch.no_grad():
-                if not freeze_hq and hasattr(hq_model.quantizer, "expire_dead_codes"):
-                    z_for_expire = hq_model.encode(x_h)
-                    n = hq_model.quantizer.expire_dead_codes(z_for_expire, images=x_h01)
-                    if n:
-                        print(f"    [Step {step+1}] HQ expired {n} dead codes")
-                if hasattr(lq_model.quantizer, "expire_dead_codes"):
-                    z_for_expire = lq_model.encode(x_l)
-                    n = lq_model.quantizer.expire_dead_codes(z_for_expire, images=x_l01)
-                    if n:
-                        print(f"    [Step {step+1}] LQ expired {n} dead codes")
+                z_for_expire = lq_model.encode(x_l)
+                n = lq_model.quantizer.expire_dead_codes(z_for_expire, images=x_l01)
+                if n:
+                    print(f"    [Step {step+1}] LQ expired {n} dead codes")
 
-        # ----- Logging -----
         if is_accum_step:
-            d_logs_h, d_logs_l = {}, {}
-        all_logs = {
-            **{f"h_{k}": v for k, v in gen_logs_h.items()},
-            **{f"l_{k}": v for k, v in gen_logs_l.items()},
-            **{f"h_{k}": v for k, v in (d_logs_h or {}).items()},
-            **{f"l_{k}": v for k, v in (d_logs_l or {}).items()},
-            "assoc": l_assoc.detach(),
-        }
+            d_logs = {}
+        all_logs = {**gen_logs, **d_logs, "assoc": l_assoc.detach()}
         for k, v in all_logs.items():
             val = v.item() if torch.is_tensor(v) else v
             if not (math.isnan(val) or math.isinf(val)):
@@ -275,9 +254,8 @@ def train_one_epoch(
         n_steps += 1
 
         if (step + 1) % log_every == 0:
-            msg = f"  OSDFace S1 | Epoch {epoch} | Step {step+1}/{len(loader)}"
-            for k in ["h_l1", "l_l1", "h_perceptual", "l_perceptual",
-                      "h_vq", "l_vq", "assoc"]:
+            msg = f"  OSDFace S1 Phase {phase} | Epoch {epoch} | Step {step+1}/{len(loader)}"
+            for k in ["l1", "perceptual", "gan_g", "vq", "gan_d", "assoc"]:
                 if k in accum:
                     msg += f" | {k}: {accum[k]/n_steps:.4f}"
             if nan_steps > 0:
@@ -286,20 +264,24 @@ def train_one_epoch(
 
     if nan_steps > 0:
         print(f"  WARNING: {nan_steps} NaN/Inf steps skipped this epoch")
-
     return {k: v / max(n_steps, 1) for k, v in accum.items()}
 
 
 # ======================================================================
-# Main training runner
+# Phase runners
 # ======================================================================
 
-def run(args, device):
-    print("=" * 60)
-    print("OSDFace Stage 1 (VRE) — joint HQ/LQ VQ-VAE + association loss")
-    print("=" * 60)
+def _build_lq_branch(args, device):
+    lq_model = build_hq_vqvae(
+        n_codes=args.lq_n_codes, embed_dim=args.embed_dim,
+    ).to(device).to(memory_format=torch.channels_last)
+    if args.grad_ckpt:
+        _enable_gradient_checkpointing(lq_model)
+    print(f"LQ branch params: {sum(p.numel() for p in lq_model.parameters()):,}")
+    return lq_model
 
-    # ----- Data -----
+
+def _make_loader(args):
     dataset = FFHQPairedDataset(data_root=args.data_root, hq_only=False)
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -308,81 +290,137 @@ def run(args, device):
         prefetch_factor=4 if args.num_workers > 0 else None,
     )
     print(f"Dataset: {len(dataset)} HQ/LQ pairs, {len(loader)} batches/epoch")
+    return loader
 
-    # ----- Models -----
+
+def _save_ckpt(path, *, epoch, lq_model, criterion, optimizer_g, optimizer_d,
+               scheduler_g, scheduler_d, scaler_g, scaler_d):
+    ckpt = {
+        "epoch": epoch,
+        "lq_model": lq_model.state_dict(),
+        "discriminator": criterion.discriminator.state_dict(),
+        "optimizer_g": optimizer_g.state_dict(),
+        "optimizer_d": optimizer_d.state_dict(),
+    }
+    if scheduler_g:
+        ckpt["scheduler_g"] = scheduler_g.state_dict()
+    if scheduler_d:
+        ckpt["scheduler_d"] = scheduler_d.state_dict()
+    if scaler_g is not None:
+        ckpt["scaler_g"] = scaler_g.state_dict()
+    if scaler_d is not None:
+        ckpt["scaler_d"] = scaler_d.state_dict()
+    torch.save(ckpt, path)
+    return ckpt
+
+
+def _try_resume(path, device, lq_model, criterion, optimizer_g, optimizer_d,
+                scheduler_g, scheduler_d, scaler_g, scaler_d):
+    if not os.path.exists(path):
+        return 0
+    ck = torch.load(path, map_location=device, weights_only=False)
+    lq_model.load_state_dict(ck["lq_model"])
+    try:
+        criterion.discriminator.load_state_dict(ck["discriminator"])
+    except RuntimeError:
+        print("  WARNING: discriminator state incompatible, reinitializing")
+    if "optimizer_g" in ck:
+        optimizer_g.load_state_dict(ck["optimizer_g"])
+    if "optimizer_d" in ck:
+        optimizer_d.load_state_dict(ck["optimizer_d"])
+    if scheduler_g and "scheduler_g" in ck:
+        scheduler_g.load_state_dict(ck["scheduler_g"])
+    if scheduler_d and "scheduler_d" in ck:
+        scheduler_d.load_state_dict(ck["scheduler_d"])
+    if scaler_g is not None and "scaler_g" in ck:
+        scaler_g.load_state_dict(ck["scaler_g"])
+    if scaler_d is not None and "scaler_d" in ck:
+        scaler_d.load_state_dict(ck["scaler_d"])
+    print(f"Resumed from epoch {ck['epoch'] + 1}")
+    return ck["epoch"] + 1
+
+
+def run_phase_a(args, device):
+    """Phase A: train HQ VQ-VAE from scratch on HQ self-reconstruction (50 epochs).
+
+    Note: this is identical in design to CRAFT Phase A. By default the
+    OSDFace pipeline does NOT run this — it reuses CRAFT's Phase A
+    checkpoint via `hq_ckpt`. This function is provided for completeness
+    so the OSDFace baseline can be trained end-to-end without any CRAFT
+    artifacts if desired.
+    """
+    print("=" * 60)
+    print("OSDFace Stage 1 — Phase A: HQ VQ-VAE (self-reconstruction)")
+    print("=" * 60)
+
+    # HQ-only dataset (LQ images not needed)
+    dataset = FFHQPairedDataset(data_root=args.data_root, hq_only=True)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
+    print(f"Dataset: {len(dataset)} HQ images, {len(loader)} batches/epoch")
+
     hq_model = build_hq_vqvae(
         n_codes=args.hq_n_codes, embed_dim=args.embed_dim,
     ).to(device).to(memory_format=torch.channels_last)
-    lq_model = build_hq_vqvae(
-        n_codes=args.lq_n_codes, embed_dim=args.embed_dim,
-    ).to(device).to(memory_format=torch.channels_last)
-
-    print(f"HQ branch params: {sum(p.numel() for p in hq_model.parameters()):,}")
-    print(f"LQ branch params: {sum(p.numel() for p in lq_model.parameters()):,}")
-
-    # Warm-start HQ branch from CRAFT Phase A (optional)
-    if args.hq_ckpt:
-        print(f"Warm-starting HQ branch from {args.hq_ckpt}")
-        ck = torch.load(args.hq_ckpt, map_location=device, weights_only=False)
-        hq_model.load_state_dict(ck["model"])
-
-    if args.freeze_hq:
-        for p in hq_model.parameters():
-            p.requires_grad_(False)
-        hq_model.eval()
-        print("HQ branch: FROZEN")
-
     if args.grad_ckpt:
         _enable_gradient_checkpointing(hq_model)
-        _enable_gradient_checkpointing(lq_model)
-        print("Gradient checkpointing enabled")
+    print(f"HQ branch params: {sum(p.numel() for p in hq_model.parameters()):,}")
 
-    # ----- Losses -----
-    # One Stage1VQLoss per branch → each owns its own PatchDiscriminator.
-    # We keep lambda_assoc=0 inside Stage1VQLoss and add the association term
-    # explicitly in the training loop so we can share one assoc loss across
-    # both branches and ramp it on a warmup schedule.
-    criterion_h = Stage1VQLoss(
+    criterion = Stage1VQLoss(
         lambda_per=args.lambda_per, lambda_dis=args.lambda_dis,
         lambda_assoc=0.0, vgg_pretrained=True,
     ).to(device)
-    criterion_l = Stage1VQLoss(
-        lambda_per=args.lambda_per, lambda_dis=args.lambda_dis,
-        lambda_assoc=0.0, vgg_pretrained=True,
-    ).to(device)
-    assoc_loss_fn = AssociationLoss().to(device)
 
-    # ----- Optimizers -----
-    gen_params = [p for p in lq_model.parameters() if p.requires_grad]
-    if not args.freeze_hq:
-        gen_params += [p for p in hq_model.parameters() if p.requires_grad]
-
-    disc_params = list(criterion_l.discriminator.parameters())
-    if not args.freeze_hq:
-        disc_params += list(criterion_h.discriminator.parameters())
-
-    optimizer_g = torch.optim.Adam(gen_params, lr=args.lr, betas=(0.5, 0.999))
-    optimizer_d = torch.optim.Adam(disc_params, lr=args.lr, betas=(0.5, 0.999))
-
-    scheduler_g = _build_scheduler(optimizer_g, args, args.epochs)
-    scheduler_d = _build_scheduler(optimizer_d, args, args.epochs)
+    optimizer_g = torch.optim.Adam(
+        list(hq_model.parameters()), lr=args.lr, betas=(0.5, 0.999),
+    )
+    optimizer_d = torch.optim.Adam(
+        criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999),
+    )
+    scheduler_g = _build_scheduler(optimizer_g, args, args.hq_epochs)
+    scheduler_d = _build_scheduler(optimizer_d, args, args.hq_epochs)
 
     use_amp = args.amp and device.type == "cuda"
     scaler_g = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
     scaler_d = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
 
-    # ----- Resume -----
-    ckpt_dir = args.ckpt_dir
+    ckpt_dir = os.path.join(args.ckpt_dir, "phase_a")
     os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Phase A self-reconstructs HQ images, so it doesn't use the LQ-branch
+    # train_one_epoch helper. We run a small inline loop here.
+    def _save_a(path, epoch):
+        ckpt = {
+            "epoch": epoch,
+            # Use the same key CRAFT Phase A uses so the checkpoint can be
+            # loaded directly via _load_frozen_hq() afterwards.
+            "model": hq_model.state_dict(),
+            "discriminator": criterion.discriminator.state_dict(),
+            "optimizer_g": optimizer_g.state_dict(),
+            "optimizer_d": optimizer_d.state_dict(),
+        }
+        if scheduler_g:
+            ckpt["scheduler_g"] = scheduler_g.state_dict()
+        if scheduler_d:
+            ckpt["scheduler_d"] = scheduler_d.state_dict()
+        if scaler_g is not None:
+            ckpt["scaler_g"] = scaler_g.state_dict()
+        if scaler_d is not None:
+            ckpt["scaler_d"] = scaler_d.state_dict()
+        torch.save(ckpt, path)
+        return ckpt
+
     start_epoch = 0
     latest = os.path.join(ckpt_dir, "latest.pt")
     if not args.fresh and os.path.exists(latest):
         ck = torch.load(latest, map_location=device, weights_only=False)
-        hq_model.load_state_dict(ck["hq_model"])
-        lq_model.load_state_dict(ck["lq_model"])
+        hq_model.load_state_dict(ck["model"])
         try:
-            criterion_h.discriminator.load_state_dict(ck["disc_h"])
-            criterion_l.discriminator.load_state_dict(ck["disc_l"])
+            criterion.discriminator.load_state_dict(ck["discriminator"])
         except RuntimeError:
             print("  WARNING: discriminator state incompatible, reinitializing")
         if "optimizer_g" in ck:
@@ -400,30 +438,190 @@ def run(args, device):
         start_epoch = ck["epoch"] + 1
         print(f"Resumed from epoch {start_epoch}")
 
-    # ----- Training loop -----
     ckpt = None
-    for epoch in range(start_epoch, args.epochs):
-        # GAN-loss warmup (both discriminators)
+    for epoch in range(start_epoch, args.hq_epochs):
         if args.gan_warmup_epochs > 0 and epoch < args.gan_warmup_epochs:
-            frac = epoch / args.gan_warmup_epochs
-            criterion_h.lambda_dis = args.lambda_dis * frac
-            criterion_l.lambda_dis = args.lambda_dis * frac
+            criterion.lambda_dis = args.lambda_dis * (epoch / args.gan_warmup_epochs)
         else:
-            criterion_h.lambda_dis = args.lambda_dis
-            criterion_l.lambda_dis = args.lambda_dis
+            criterion.lambda_dis = args.lambda_dis
+        print(f"  lambda_dis={criterion.lambda_dis:.3f}")
 
-        # Association-loss warmup
-        if epoch < args.assoc_warmup_epochs:
-            lambda_assoc = 0.0
+        hq_model.train()
+        criterion.discriminator.train()
+        accum = defaultdict(float)
+        n_steps = 0
+        nan_steps = 0
+        t0 = time.time()
+
+        for step, batch in enumerate(loader):
+            batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+                     for k, v in batch.items()}
+            x = batch["hq"]
+            x01 = batch["hq_01"]
+
+            is_accum_step = (step + 1) % args.grad_accum_steps != 0
+            is_first_accum = step % args.grad_accum_steps == 0
+            loss_scale = 1.0 / args.grad_accum_steps
+
+            if is_first_accum:
+                optimizer_g.zero_grad()
+
+            with autocast("cuda", enabled=use_amp):
+                x_rec, z, z_q, vq_losses, _ = hq_model(x, images_01=x01, masks=None)
+                gen_loss, gen_logs = criterion.generator_loss(
+                    x_rec, x, vq_losses["total_vq"],
+                )
+                gen_loss = gen_loss * loss_scale
+
+            if torch.isnan(gen_loss) or torch.isinf(gen_loss):
+                nan_steps += 1
+                optimizer_g.zero_grad()
+                optimizer_d.zero_grad()
+                if scaler_g is not None:
+                    scaler_g._scale = torch.tensor(2**10, dtype=torch.float32, device=device)
+                if scaler_d is not None:
+                    scaler_d._scale = torch.tensor(2**10, dtype=torch.float32, device=device)
+                continue
+
+            if scaler_g is not None:
+                scaler_g.scale(gen_loss).backward()
+            else:
+                gen_loss.backward()
+
+            if not is_accum_step:
+                if args.grad_clip_norm > 0:
+                    if scaler_g is not None:
+                        scaler_g.unscale_(optimizer_g)
+                    torch.nn.utils.clip_grad_norm_(
+                        hq_model.parameters(), max_norm=args.grad_clip_norm,
+                    )
+                if scaler_g is not None:
+                    scaler_g.step(optimizer_g)
+                    scaler_g.update()
+                else:
+                    optimizer_g.step()
+
+            if not is_accum_step:
+                optimizer_d.zero_grad()
+                with autocast("cuda", enabled=use_amp):
+                    d_loss, d_logs = criterion.discriminator_loss(x, x_rec.detach())
+                if scaler_d is not None:
+                    scaler_d.scale(d_loss).backward()
+                    scaler_d.unscale_(optimizer_d)
+                else:
+                    d_loss.backward()
+                if args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        criterion.discriminator.parameters(),
+                        max_norm=args.grad_clip_norm,
+                    )
+                if scaler_d is not None:
+                    scaler_d.step(optimizer_d)
+                    scaler_d.update()
+                else:
+                    optimizer_d.step()
+
+            if (step + 1) % args.expire_every == 0 and hasattr(hq_model.quantizer, "expire_dead_codes"):
+                with torch.no_grad():
+                    z_for_expire = hq_model.encode(x)
+                    n = hq_model.quantizer.expire_dead_codes(z_for_expire, images=x01)
+                    if n:
+                        print(f"    [Step {step+1}] HQ expired {n} dead codes")
+
+            if is_accum_step:
+                d_logs = {}
+            for k, v in {**gen_logs, **d_logs}.items():
+                val = v.item() if torch.is_tensor(v) else v
+                if not (math.isnan(val) or math.isinf(val)):
+                    accum[k] += val
+            n_steps += 1
+
+            if (step + 1) % args.log_every == 0:
+                msg = f"  OSDFace S1 Phase A | Epoch {epoch} | Step {step+1}/{len(loader)}"
+                for k in ["l1", "perceptual", "gan_g", "vq", "gan_d"]:
+                    if k in accum:
+                        msg += f" | {k}: {accum[k]/n_steps:.4f}"
+                if nan_steps > 0:
+                    msg += f" | nan_skips: {nan_steps}"
+                print(msg)
+
+        if scheduler_g:
+            scheduler_g.step()
+        if scheduler_d:
+            scheduler_d.step()
+        elapsed = time.time() - t0
+        print(
+            f"OSDFace S1 Phase A | Epoch {epoch} done in {elapsed:.0f}s | "
+            f"L1={accum.get('l1', 0)/max(n_steps,1):.4f} "
+            f"VQ={accum.get('vq', 0)/max(n_steps,1):.4f}"
+        )
+
+        ckpt = _save_a(latest, epoch)
+        if (epoch + 1) % args.save_every == 0:
+            torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
+
+    if ckpt is not None:
+        torch.save(ckpt, os.path.join(ckpt_dir, "final.pt"))
+        print(f"OSDFace S1 Phase A complete. Saved to {ckpt_dir}/final.pt")
+
+    return hq_model
+
+
+def run_phase_b(args, device, hq_model=None, lq_model=None):
+    """Phase B: train LQ VQ-VAE, HQ frozen, λ_assoc=0 (10 epochs)."""
+    print("=" * 60)
+    print("OSDFace Stage 1 — Phase B: LQ VQ-VAE (lambda_assoc = 0)")
+    print("=" * 60)
+
+    if hq_model is None:
+        hq_model = _load_frozen_hq(args, device)
+    if lq_model is None:
+        lq_model = _build_lq_branch(args, device)
+
+    loader = _make_loader(args)
+
+    criterion = Stage1VQLoss(
+        lambda_per=args.lambda_per, lambda_dis=args.lambda_dis,
+        lambda_assoc=0.0, vgg_pretrained=True,
+    ).to(device)
+    assoc_loss_fn = AssociationLoss().to(device)
+
+    optimizer_g = torch.optim.Adam(
+        [p for p in lq_model.parameters() if p.requires_grad],
+        lr=args.lr, betas=(0.5, 0.999),
+    )
+    optimizer_d = torch.optim.Adam(
+        criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999),
+    )
+    scheduler_g = _build_scheduler(optimizer_g, args, args.lq_epochs)
+    scheduler_d = _build_scheduler(optimizer_d, args, args.lq_epochs)
+
+    use_amp = args.amp and device.type == "cuda"
+    scaler_g = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+    scaler_d = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+
+    ckpt_dir = os.path.join(args.ckpt_dir, "phase_b")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    start_epoch = 0
+    if not args.fresh:
+        start_epoch = _try_resume(
+            os.path.join(ckpt_dir, "latest.pt"), device, lq_model, criterion,
+            optimizer_g, optimizer_d, scheduler_g, scheduler_d, scaler_g, scaler_d,
+        )
+
+    ckpt = None
+    for epoch in range(start_epoch, args.lq_epochs):
+        if args.gan_warmup_epochs > 0 and epoch < args.gan_warmup_epochs:
+            criterion.lambda_dis = args.lambda_dis * (epoch / args.gan_warmup_epochs)
         else:
-            lambda_assoc = args.lambda_assoc
-        print(f"  lambda_dis={criterion_l.lambda_dis:.3f}  lambda_assoc={lambda_assoc:.3f}")
+            criterion.lambda_dis = args.lambda_dis
+        print(f"  lambda_dis={criterion.lambda_dis:.3f}  lambda_assoc=0.000")
 
         t0 = time.time()
         avg_logs = train_one_epoch(
-            hq_model, lq_model, criterion_h, criterion_l, assoc_loss_fn,
-            lambda_assoc, loader, optimizer_g, optimizer_d, device, epoch,
-            freeze_hq=args.freeze_hq,
+            lq_model, hq_model, criterion, assoc_loss_fn, 0.0,
+            loader, optimizer_g, optimizer_d, device, epoch, phase="B",
             expire_every=args.expire_every, log_every=args.log_every,
             grad_clip_norm=args.grad_clip_norm,
             use_amp=use_amp, scaler_g=scaler_g, scaler_d=scaler_d,
@@ -435,36 +633,123 @@ def run(args, device):
             scheduler_d.step()
         elapsed = time.time() - t0
         print(
-            f"OSDFace S1 | Epoch {epoch} done in {elapsed:.0f}s | "
-            f"h_L1={avg_logs.get('h_l1', 0):.4f} l_L1={avg_logs.get('l_l1', 0):.4f} "
-            f"assoc={avg_logs.get('assoc', 0):.4f}"
+            f"OSDFace S1 Phase B | Epoch {epoch} done in {elapsed:.0f}s | "
+            f"L1={avg_logs.get('l1', 0):.4f} VQ={avg_logs.get('vq', 0):.4f}"
         )
 
-        ckpt = {
-            "epoch": epoch,
-            "hq_model": hq_model.state_dict(),
-            "lq_model": lq_model.state_dict(),
-            "disc_h": criterion_h.discriminator.state_dict(),
-            "disc_l": criterion_l.discriminator.state_dict(),
-            "optimizer_g": optimizer_g.state_dict(),
-            "optimizer_d": optimizer_d.state_dict(),
-        }
-        if scheduler_g:
-            ckpt["scheduler_g"] = scheduler_g.state_dict()
-        if scheduler_d:
-            ckpt["scheduler_d"] = scheduler_d.state_dict()
-        if scaler_g is not None:
-            ckpt["scaler_g"] = scaler_g.state_dict()
-        if scaler_d is not None:
-            ckpt["scaler_d"] = scaler_d.state_dict()
-
-        torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
+        ckpt = _save_ckpt(
+            os.path.join(ckpt_dir, "latest.pt"),
+            epoch=epoch, lq_model=lq_model, criterion=criterion,
+            optimizer_g=optimizer_g, optimizer_d=optimizer_d,
+            scheduler_g=scheduler_g, scheduler_d=scheduler_d,
+            scaler_g=scaler_g, scaler_d=scaler_d,
+        )
         if (epoch + 1) % args.save_every == 0:
             torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
 
     if ckpt is not None:
         torch.save(ckpt, os.path.join(ckpt_dir, "final.pt"))
-        print(f"OSDFace Stage 1 complete. Saved to {ckpt_dir}/final.pt")
+        print(f"OSDFace S1 Phase B complete. Saved to {ckpt_dir}/final.pt")
+
+    return hq_model, lq_model
+
+
+def run_phase_c(args, device, hq_model=None, lq_model=None):
+    """Phase C: continue LQ VQ-VAE with λ_assoc=1 (10 epochs)."""
+    print("=" * 60)
+    print("OSDFace Stage 1 — Phase C: LQ VQ-VAE + Association Loss "
+          "(lambda_assoc = 1)")
+    print("=" * 60)
+
+    if hq_model is None:
+        hq_model = _load_frozen_hq(args, device)
+    if lq_model is None:
+        lq_model = _build_lq_branch(args, device)
+        if not args.lq_ckpt:
+            raise ValueError(
+                "Phase C requires `lq_ckpt` (Phase B checkpoint). Set it in "
+                "the config or pass --lq_ckpt."
+            )
+        print(f"Loading Phase B LQ branch from {args.lq_ckpt}")
+        ck = torch.load(args.lq_ckpt, map_location=device, weights_only=False)
+        lq_model.load_state_dict(ck["lq_model"])
+
+    loader = _make_loader(args)
+
+    criterion = Stage1VQLoss(
+        lambda_per=args.lambda_per, lambda_dis=args.lambda_dis,
+        lambda_assoc=0.0, vgg_pretrained=True,
+    ).to(device)
+    assoc_loss_fn = AssociationLoss().to(device)
+
+    optimizer_g = torch.optim.Adam(
+        [p for p in lq_model.parameters() if p.requires_grad],
+        lr=args.lr, betas=(0.5, 0.999),
+    )
+    optimizer_d = torch.optim.Adam(
+        criterion.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.999),
+    )
+    scheduler_g = _build_scheduler(optimizer_g, args, args.assoc_epochs)
+    scheduler_d = _build_scheduler(optimizer_d, args, args.assoc_epochs)
+
+    use_amp = args.amp and device.type == "cuda"
+    scaler_g = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+    scaler_d = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+
+    ckpt_dir = os.path.join(args.ckpt_dir, "phase_c")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    start_epoch = 0
+    if not args.fresh:
+        start_epoch = _try_resume(
+            os.path.join(ckpt_dir, "latest.pt"), device, lq_model, criterion,
+            optimizer_g, optimizer_d, scheduler_g, scheduler_d, scaler_g, scaler_d,
+        )
+
+    ckpt = None
+    for epoch in range(start_epoch, args.assoc_epochs):
+        if args.gan_warmup_epochs > 0 and epoch < args.gan_warmup_epochs:
+            criterion.lambda_dis = args.lambda_dis * (epoch / args.gan_warmup_epochs)
+        else:
+            criterion.lambda_dis = args.lambda_dis
+        print(f"  lambda_dis={criterion.lambda_dis:.3f}  "
+              f"lambda_assoc={args.lambda_assoc:.3f}")
+
+        t0 = time.time()
+        avg_logs = train_one_epoch(
+            lq_model, hq_model, criterion, assoc_loss_fn, args.lambda_assoc,
+            loader, optimizer_g, optimizer_d, device, epoch, phase="C",
+            expire_every=args.expire_every, log_every=args.log_every,
+            grad_clip_norm=args.grad_clip_norm,
+            use_amp=use_amp, scaler_g=scaler_g, scaler_d=scaler_d,
+            grad_accum_steps=args.grad_accum_steps,
+        )
+        if scheduler_g:
+            scheduler_g.step()
+        if scheduler_d:
+            scheduler_d.step()
+        elapsed = time.time() - t0
+        print(
+            f"OSDFace S1 Phase C | Epoch {epoch} done in {elapsed:.0f}s | "
+            f"L1={avg_logs.get('l1', 0):.4f} VQ={avg_logs.get('vq', 0):.4f} "
+            f"assoc={avg_logs.get('assoc', 0):.4f}"
+        )
+
+        ckpt = _save_ckpt(
+            os.path.join(ckpt_dir, "latest.pt"),
+            epoch=epoch, lq_model=lq_model, criterion=criterion,
+            optimizer_g=optimizer_g, optimizer_d=optimizer_d,
+            scheduler_g=scheduler_g, scheduler_d=scheduler_d,
+            scaler_g=scaler_g, scaler_d=scaler_d,
+        )
+        if (epoch + 1) % args.save_every == 0:
+            torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
+
+    if ckpt is not None:
+        torch.save(ckpt, os.path.join(ckpt_dir, "final.pt"))
+        print(f"OSDFace S1 Phase C complete. Saved to {ckpt_dir}/final.pt")
+
+    return hq_model, lq_model
 
 
 # ======================================================================
@@ -476,6 +761,13 @@ def parse_args():
 
     parser.add_argument("--config", type=str, default="",
                         help="Path to YAML config (e.g. configs/train_osdface.yaml)")
+    parser.add_argument("--phase", type=str, default="all",
+                        choices=["A", "B", "C", "all"],
+                        help="Training phase: A (HQ, 50 ep), B (LQ, lambda_assoc=0, "
+                             "10 ep), C (LQ + association, 10 ep), or all. "
+                             "NOTE: --phase all runs B and C only and reuses "
+                             "`hq_ckpt` for the HQ branch; pass --phase A to "
+                             "train the HQ branch from scratch.")
 
     # Data
     parser.add_argument("--data_root", type=str,
@@ -494,27 +786,25 @@ def parse_args():
                         choices=["none", "cosine"])
     parser.add_argument("--warmup_epochs", type=int, default=2)
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--hq_epochs", type=int, default=50,
+                        help="Phase A epochs (paper: 50)")
+    parser.add_argument("--lq_epochs", type=int, default=10,
+                        help="Phase B epochs (paper: 10)")
+    parser.add_argument("--assoc_epochs", type=int, default=10,
+                        help="Phase C epochs (paper: 10)")
 
     # Loss weights
     parser.add_argument("--lambda_per", type=float, default=1.0)
     parser.add_argument("--lambda_dis", type=float, default=0.8)
     parser.add_argument("--lambda_assoc", type=float, default=1.0)
-    parser.add_argument("--assoc_warmup_epochs", type=int, default=5)
     parser.add_argument("--gan_warmup_epochs", type=int, default=2)
 
-    # HQ branch
+    # Checkpoints
     parser.add_argument("--hq_ckpt", type=str,
                         default="/projectnb/cs585/projects/craft/checkpoints/phase_a/final.pt",
-                        help="CRAFT Phase A checkpoint to warm-start HQ branch (default: reuse CRAFT Phase A)")
-    # freeze_hq defaults to True; pass --no_freeze_hq to train HQ jointly.
-    parser.add_argument("--freeze_hq", dest="freeze_hq", action="store_true",
-                        help="Freeze HQ branch (default)")
-    parser.add_argument("--no_freeze_hq", dest="freeze_hq", action="store_false",
-                        help="Train HQ branch jointly with LQ branch")
-    parser.set_defaults(freeze_hq=True)
-
-    # Checkpointing
+                        help="CRAFT Phase A checkpoint, used as the frozen HQ branch")
+    parser.add_argument("--lq_ckpt", type=str, default="",
+                        help="OSDFace Phase B checkpoint, required for --phase C")
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints_osdface")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--save_every", type=int, default=5)
@@ -543,7 +833,27 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"Config: {json.dumps(vars(args), indent=2)}")
-    run(args, device)
+
+    hq_model, lq_model = None, None
+
+    if args.phase == "A":
+        run_phase_a(args, device)
+        print("\nOSDFace Stage 1 Phase A complete!")
+        return
+
+    if args.phase in ("B", "all"):
+        hq_model, lq_model = run_phase_b(args, device,
+                                         hq_model=hq_model, lq_model=lq_model)
+        if args.phase == "all":
+            args.lq_ckpt = os.path.join(args.ckpt_dir, "phase_b", "final.pt")
+
+    if args.phase in ("C", "all"):
+        # For --phase C alone, lq_model is None and Phase C will load from args.lq_ckpt.
+        # For --phase all, we already have lq_model in memory and skip the disk reload.
+        run_phase_c(args, device,
+                    hq_model=hq_model,
+                    lq_model=lq_model if args.phase == "all" else None)
+
     print("\nOSDFace Stage 1 training complete!")
 
 

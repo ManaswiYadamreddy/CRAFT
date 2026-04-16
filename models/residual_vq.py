@@ -56,7 +56,7 @@ class VQLevel(nn.Module):
         eps:       Laplace smoothing epsilon for EMA counts (default: 1e-5).
     """
 
-    def __init__(self, n_codes=256, e_dim=512, beta=0.25, ema_decay=0.95, eps=1e-5):
+    def __init__(self, n_codes=256, e_dim=512, beta=0.25, ema_decay=0.99, eps=1e-5):
         super().__init__()
         self.n_codes = n_codes
         self.e_dim = e_dim
@@ -262,7 +262,7 @@ class ResidualVQ(nn.Module):
         e_dim=512,
         n_levels=3,
         beta=0.25,
-        ema_decay=0.95,
+        ema_decay=0.99,
         entropy_weight=0.1,
     ):
         super().__init__()

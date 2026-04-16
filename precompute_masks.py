@@ -7,7 +7,7 @@ in Phases B and C.
 
 Output structure:
     data_root/
-    └── masks_16x16/
+    └── BiSeNet_masks_16x16/
         ├── 00000_hq.pt       # (16, 16) int64 region indices for HQ image
         ├── 00000_lq.pt       # (16, 16) int64 region indices for LQ image
         └── ...
@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--parser_ckpt", type=str, required=True)
     parser.add_argument("--hq_folder", type=str, default="images512x512")
     parser.add_argument("--lq_folder", type=str, default="LQ_images_512x512")
-    parser.add_argument("--output_folder", type=str, default="masks_16x16")
+    parser.add_argument("--output_folder", type=str, default="BiSeNet_masks_16x16")
     parser.add_argument("--target_h", type=int, default=16)
     parser.add_argument("--target_w", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=32)

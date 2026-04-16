@@ -72,7 +72,7 @@ class RegionAwareVQ(nn.Module):
         e_dim=512,
         n_levels=3,
         beta=0.25,
-        ema_decay=0.95,
+        ema_decay=0.99,
         entropy_weight=0.1,
         parser_ckpt=None,
     ):

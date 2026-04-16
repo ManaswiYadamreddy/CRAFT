@@ -925,7 +925,7 @@ def parse_args():
                         help="Gradient accumulation steps (effective batch = batch_size * accum)")
 
     # Misc
-    parser.add_argument("--expire_every", type=int, default=1000,
+    parser.add_argument("--expire_every", type=int, default=500,
                         help="Dead code expiry interval (steps)")
     parser.add_argument("--log_every", type=int, default=50,
                         help="Print logs every N steps")

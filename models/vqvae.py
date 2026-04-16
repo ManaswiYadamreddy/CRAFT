@@ -388,7 +388,7 @@ class GlobalVQ(nn.Module):
         entropy_weight: Entropy regularization weight (default: 0.1).
     """
 
-    def __init__(self, n_codes=1024, e_dim=512, beta=0.25, ema_decay=0.95,
+    def __init__(self, n_codes=1024, e_dim=512, beta=0.25, ema_decay=0.99,
                  entropy_weight=0.1):
         super().__init__()
         self.n_codes = n_codes

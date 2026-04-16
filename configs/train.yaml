@@ -22,7 +22,7 @@ lr: 1.44e-4
 lr_schedule: cosine      # none | cosine
 warmup_epochs: 2         # linear warmup epochs before cosine decay
 grad_clip_norm: 1.0      # max gradient norm (prevents NaN from GAN loss spikes)
-hq_epochs: 50            # Phase A
+hq_epochs: 55           # Phase A
 lq_epochs: 20            # Phase B
 assoc_epochs: 10         # Phase C
 

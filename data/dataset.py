@@ -43,7 +43,7 @@ class FFHQPairedDataset(Dataset):
         data_root:     Path to 'train/' directory containing the image folders.
         hq_folder:     Name of HQ image subfolder (default: 'images512x512').
         lq_folder:     Name of LQ image subfolder (default: 'LQ_images_512x512').
-        masks_folder:  Name of pre-computed masks subfolder (default: 'masks_16x16').
+        masks_folder:  Name of pre-computed masks subfolder (default: 'BiSeNet_masks_16x16').
                        Set to "" to disable loading masks.
         resolution:    Target resolution (default: 512).
         hq_only:       If True, only load HQ images (for HQ VQVAE pre-training).
@@ -55,7 +55,7 @@ class FFHQPairedDataset(Dataset):
         data_root,
         hq_folder="images512x512",
         lq_folder="LQ_images_512x512",
-        masks_folder="masks_16x16",
+        masks_folder="BiSeNet_masks_16x16",
         resolution=512,
         hq_only=False,
     ):

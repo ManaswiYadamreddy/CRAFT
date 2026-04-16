@@ -1,0 +1,70 @@
+# OSDFace Stage 1 (VRE) — Training configuration
+#
+# Mirrors the OSDFace paper (§3.2): the HQ VQ-VAE is trained for 50 epochs,
+# then the LQ VQ-VAE is trained for 10 epochs with lambda_assoc=0, followed
+# by an additional 10 epochs with lambda_assoc=1. HQ is frozen during the
+# LQ phases.
+#
+# We reuse CRAFT's Phase A checkpoint as the HQ branch (it is the same
+# MultiHeadEncoder/Decoder + GlobalVQ that OSDFace Stage 1's HQ branch is
+# in this codebase), so only the LQ branch needs to be trained here.
+#
+# To stay comparable with CRAFT, both codebooks live on the unit hypersphere
+# and quantize via cosine similarity (CRAFT's GlobalVQ), instead of the
+# raw-space L2 quantizer described in the original paper.
+#
+# Usage:
+#   # Phases B and C sequentially (10 + 10 epochs)
+#   python train_osdface_stage1.py --config configs/train_osdface.yaml --phase all
+#
+#   # Phase B only
+#   python train_osdface_stage1.py --config configs/train_osdface.yaml --phase B
+#
+#   # Phase C only (continues from Phase B checkpoint)
+#   python train_osdface_stage1.py --config configs/train_osdface.yaml --phase C
+
+# Data
+data_root: /projectnb/cs585/projects/craft/data/train
+num_workers: 12
+
+# Architecture (must match CRAFT for apples-to-apples comparison)
+embed_dim: 512
+hq_n_codes: 1024
+lq_n_codes: 1024
+
+# Training hyperparameters
+batch_size: 32
+lr: 1.44e-4
+lr_schedule: cosine
+warmup_epochs: 2
+grad_clip_norm: 1.0
+
+# Phase epochs (paper: 50 + 10 + 10)
+hq_epochs: 50           # Phase A  (HQ self-recon, only used by --phase A)
+lq_epochs: 10           # Phase B  (lambda_assoc = 0)
+assoc_epochs: 10        # Phase C  (lambda_assoc = 1)
+
+# Loss weights (OSDFace Eq. 8, 11)
+lambda_per: 1.0
+lambda_dis: 0.8
+lambda_assoc: 1.0
+gan_warmup_epochs: 2
+
+# HQ branch (always frozen; reuses CRAFT Phase A final.pt)
+hq_ckpt: /projectnb/cs585/projects/craft/checkpoints/phase_a/final.pt
+lq_ckpt: ""             # Phase B checkpoint, used by Phase C
+
+# Checkpointing
+ckpt_dir: /projectnb/cs585/projects/craft/checkpoints_osdface
+fresh: false
+save_every: 1
+
+# Memory optimization
+amp: true
+grad_ckpt: true
+grad_accum_steps: 4
+
+# Misc
+expire_every: 1000
+log_every: 50
+device: cuda

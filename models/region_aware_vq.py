@@ -20,8 +20,11 @@ Dependencies:
     - face_parser.py (FaceParser, REGION_NAMES)
 """
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .residual_vq import ResidualVQ
 from .face_parser import FaceParser, REGION_NAMES
@@ -66,6 +69,20 @@ class RegionAwareVQ(nn.Module):
         "bg":   256,
     }
 
+    # Default per-region EMA expiry thresholds.
+    # Steady-state ema_count for a uniformly-used code equals positions/batch / n_codes,
+    # so small-region codebooks need lower thresholds to avoid flagging healthy codes:
+    #   eyes: ~3 pos/img * 32 / 128 codes ≈ 0.75  → threshold 0.3
+    #   lips: ~3 pos/img * 32 /  64 codes ≈ 1.5   → threshold 0.3
+    # Large regions (skin/hair/bg) are comfortable at 1.0.
+    DEFAULT_EXPIRE_THRESHOLDS = {
+        "eyes": 0.3,
+        "skin": 1.0,
+        "hair": 1.0,
+        "lips": 0.3,
+        "bg":   1.0,
+    }
+
     def __init__(
         self,
         region_n_codes=None,
@@ -75,6 +92,9 @@ class RegionAwareVQ(nn.Module):
         ema_decay=0.99,
         entropy_weight=0.1,
         parser_ckpt=None,
+        use_magnitude_head=False,
+        magnitude_init=1.0,
+        expire_thresholds=None,
     ):
         super().__init__()
         self.e_dim = e_dim
@@ -83,6 +103,10 @@ class RegionAwareVQ(nn.Module):
         if region_n_codes is None:
             region_n_codes = self.DEFAULT_REGION_N_CODES
         self.region_n_codes = region_n_codes
+
+        if expire_thresholds is None:
+            expire_thresholds = dict(self.DEFAULT_EXPIRE_THRESHOLDS)
+        self.expire_thresholds = expire_thresholds
 
         # --- Face parser (frozen, no gradients) ---
         self.face_parser = FaceParser(checkpoint_path=parser_ckpt)
@@ -101,6 +125,24 @@ class RegionAwareVQ(nn.Module):
                 for name in REGION_NAMES
             }
         )
+
+        # --- Per-position magnitude head (optional) ---
+        # Each region's ResidualVQ collapses spatial magnitude to a single
+        # scalar (`codebook_scale`). The magnitude head predicts a positive
+        # multiplicative factor per spatial position from the pre-quantized
+        # feature map, restoring the magnitude information the quantizer
+        # discards. Init is softplus(bias)=magnitude_init with zero weights,
+        # so the layer acts as identity at step 0 and a checkpoint loaded
+        # with strict=False behaves identically to the old quantizer.
+        self.use_magnitude_head = use_magnitude_head
+        if use_magnitude_head:
+            self.magnitude_head = nn.Conv2d(e_dim, 1, kernel_size=1)
+            nn.init.zeros_(self.magnitude_head.weight)
+            # softplus(b) = m  =>  b = log(exp(m) - 1)
+            nn.init.constant_(
+                self.magnitude_head.bias,
+                math.log(math.exp(float(magnitude_init)) - 1.0),
+            )
 
     def forward(self, z, images, masks=None):
         """
@@ -177,6 +219,17 @@ class RegionAwareVQ(nn.Module):
         # (B, H*W, C) → (B, C, H, W)
         z_q = z_q_flat.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
+        # --- Step 5: Per-position magnitude scaling (optional) ---
+        # Restores per-position magnitude info that the VQ scalar discards.
+        if self.use_magnitude_head:
+            mag = F.softplus(self.magnitude_head(z))  # (B, 1, H, W)
+            z_q = z_q * mag
+            mag_d = mag.detach().float()
+            all_info["mag/mean"] = mag_d.mean()
+            all_info["mag/std"] = mag_d.std()
+            all_info["mag/min"] = mag_d.min()
+            all_info["mag/max"] = mag_d.max()
+
         return z_q, all_losses, all_info
 
     # ------------------------------------------------------------------
@@ -225,8 +278,9 @@ class RegionAwareVQ(nn.Module):
             mask = masks_flat[name]
             region_features = z_flat[mask]
             if region_features.shape[0] > 0:
+                threshold = self.expire_thresholds.get(name, 1.0)
                 expired[name] = self.region_codebooks[name].expire_dead_codes(
-                    region_features
+                    region_features, threshold=threshold,
                 )
             else:
                 expired[name] = 0

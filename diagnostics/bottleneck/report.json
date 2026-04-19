@@ -1,0 +1,165 @@
+{
+  "n_images": 128,
+  "variants": {
+    "hq_normal": {
+      "psnr_mean": 19.8847391869207,
+      "psnr_std": 1.701646454401983,
+      "ssim_mean": 0.6542207859456539,
+      "l1_mean": 0.07501850323751569
+    },
+    "hq_bypass": {
+      "psnr_mean": 16.846006853448287,
+      "psnr_std": 1.5695676796206584,
+      "ssim_mean": 0.6069720946252346,
+      "l1_mean": 0.1100836512632668
+    },
+    "craft_normal": {
+      "psnr_mean": 21.006081322623416,
+      "psnr_std": 1.6335795659987804,
+      "ssim_mean": 0.6383836530148983,
+      "l1_mean": 0.06425052392296493
+    },
+    "craft_bypass": {
+      "psnr_mean": 15.452156052554146,
+      "psnr_std": 1.796508884144627,
+      "ssim_mean": 0.49165513180196285,
+      "l1_mean": 0.12941417377442122
+    },
+    "hq_enc_craft_dec": {
+      "psnr_mean": 15.622804570367325,
+      "psnr_std": 1.6702028049354984,
+      "ssim_mean": 0.5460016615688801,
+      "l1_mean": 0.12866645259782672
+    },
+    "lq_enc_hq_dec": {
+      "psnr_mean": 17.854126911607196,
+      "psnr_std": 1.4155050382260672,
+      "ssim_mean": 0.5956813469529152,
+      "l1_mean": 0.096421520691365
+    }
+  },
+  "hq_vq_cost_db": -3.0387323334724137,
+  "craft_vq_cost_db": -5.55392527006927,
+  "code_usage": [
+    {
+      "region": "eyes",
+      "level": 0,
+      "n_codes": 128,
+      "used": 110,
+      "frac_used": 0.859375,
+      "hits": 502
+    },
+    {
+      "region": "eyes",
+      "level": 1,
+      "n_codes": 128,
+      "used": 88,
+      "frac_used": 0.6875,
+      "hits": 502
+    },
+    {
+      "region": "eyes",
+      "level": 2,
+      "n_codes": 128,
+      "used": 98,
+      "frac_used": 0.765625,
+      "hits": 502
+    },
+    {
+      "region": "skin",
+      "level": 0,
+      "n_codes": 256,
+      "used": 256,
+      "frac_used": 1.0,
+      "hits": 3649
+    },
+    {
+      "region": "skin",
+      "level": 1,
+      "n_codes": 256,
+      "used": 256,
+      "frac_used": 1.0,
+      "hits": 3649
+    },
+    {
+      "region": "skin",
+      "level": 2,
+      "n_codes": 256,
+      "used": 256,
+      "frac_used": 1.0,
+      "hits": 3649
+    },
+    {
+      "region": "hair",
+      "level": 0,
+      "n_codes": 512,
+      "used": 508,
+      "frac_used": 0.9921875,
+      "hits": 3895
+    },
+    {
+      "region": "hair",
+      "level": 1,
+      "n_codes": 512,
+      "used": 507,
+      "frac_used": 0.990234375,
+      "hits": 3895
+    },
+    {
+      "region": "hair",
+      "level": 2,
+      "n_codes": 512,
+      "used": 510,
+      "frac_used": 0.99609375,
+      "hits": 3895
+    },
+    {
+      "region": "lips",
+      "level": 0,
+      "n_codes": 64,
+      "used": 64,
+      "frac_used": 1.0,
+      "hits": 370
+    },
+    {
+      "region": "lips",
+      "level": 1,
+      "n_codes": 64,
+      "used": 60,
+      "frac_used": 0.9375,
+      "hits": 370
+    },
+    {
+      "region": "lips",
+      "level": 2,
+      "n_codes": 64,
+      "used": 63,
+      "frac_used": 0.984375,
+      "hits": 370
+    },
+    {
+      "region": "bg",
+      "level": 0,
+      "n_codes": 256,
+      "used": 256,
+      "frac_used": 1.0,
+      "hits": 24352
+    },
+    {
+      "region": "bg",
+      "level": 1,
+      "n_codes": 256,
+      "used": 256,
+      "frac_used": 1.0,
+      "hits": 24352
+    },
+    {
+      "region": "bg",
+      "level": 2,
+      "n_codes": 256,
+      "used": 256,
+      "frac_used": 1.0,
+      "hits": 24352
+    }
+  ]
+}

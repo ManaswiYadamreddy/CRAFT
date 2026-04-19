@@ -401,13 +401,18 @@ class ResidualVQ(nn.Module):
         return z_q * self.codebook_scale.abs()
 
     @torch.no_grad()
-    def expire_dead_codes(self, z):
+    def expire_dead_codes(self, z, threshold=1.0):
         """
         Replace dead codebook entries across all levels.
         Call periodically during training (e.g., every N steps).
 
         Args:
-            z: (N, e_dim) encoder outputs to sample replacements from.
+            z:         (N, e_dim) encoder outputs to sample replacements from.
+            threshold: EMA count below which a code is considered dead.
+                       For regions with few positions/batch (eyes, lips),
+                       use a value below the steady-state uniform-use
+                       expectation (~positions_per_batch / n_codes) so we
+                       don't flag healthy codes.
 
         Returns:
             n_expired: total number of codes replaced across all levels.
@@ -420,7 +425,9 @@ class ResidualVQ(nn.Module):
             r_normed = F.normalize(residual.float(), dim=1).to(residual.dtype)
             sim = r_normed @ vq_level.embedding.weight.t()
             indices = sim.argmax(dim=-1)
-            n_expired = vq_level._expire_dead_codes(r_normed, indices)
+            n_expired = vq_level._expire_dead_codes(
+                r_normed, indices, threshold=threshold,
+            )
             total_expired += n_expired
             z_q = vq_level.embedding(indices)
             residual = residual - z_q

@@ -849,6 +849,211 @@ def run_phase_c(args, device, hq_model=None, lq_model=None):
     return model
 
 
+def run_phase_d(args, device, hq_model=None, lq_model=None):
+    """Phase D: Magnitude-head fine-tune on top of Phase C (5 epochs).
+
+    Warm-starts from phase_c/final.pt with `use_magnitude_head=True`. The
+    magnitude head is initialized so softplus(bias)=1.0 and weights=0, i.e.
+    step 0 is an exact identity — the checkpoint loaded with strict=False
+    behaves identically to Phase C until the head learns. Uses per-region
+    expiry thresholds (eyes/lips=0.3) so small codebooks aren't churned.
+    """
+    if _is_main_process():
+        print("=" * 60)
+        print("Phase D: Magnitude-Head Fine-Tune")
+        print("=" * 60)
+
+    # --- HQ model (frozen, for association loss) ---
+    if hq_model is None:
+        if not args.hq_ckpt:
+            raise ValueError("Phase D requires --hq_ckpt (Phase A checkpoint)")
+        print(f"Loading HQ model from {args.hq_ckpt}")
+        hq_model = build_hq_vqvae(
+            n_codes=args.hq_n_codes, embed_dim=args.embed_dim,
+        ).to(device)
+        hq_ckpt = torch.load(args.hq_ckpt, map_location=device, weights_only=False)
+        hq_model.load_state_dict(hq_ckpt["model"])
+
+    hq_model.eval()
+    for p in hq_model.parameters():
+        p.requires_grad_(False)
+    print("HQ model frozen.")
+
+    # --- LQ model: build with magnitude head, warm-start from Phase C ---
+    ravq = RegionAwareVQ(
+        e_dim=args.embed_dim,
+        n_levels=args.rq_levels,
+        parser_ckpt=args.parser_ckpt,
+        use_magnitude_head=True,
+        magnitude_init=1.0,
+    ).to(device)
+    model = build_lq_vqvae(ravq, embed_dim=args.embed_dim).to(device).to(memory_format=torch.channels_last)
+
+    src_ckpt_path = args.phase_c_ckpt or os.path.join(
+        args.ckpt_dir, "phase_c", "final.pt",
+    )
+    if lq_model is None:
+        if not os.path.exists(src_ckpt_path):
+            raise FileNotFoundError(
+                f"Phase D needs a Phase C checkpoint at {src_ckpt_path} "
+                "(override with --phase_c_ckpt)"
+            )
+        print(f"Warm-starting LQ model from {src_ckpt_path} (strict=False)")
+        src_ckpt = torch.load(src_ckpt_path, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(src_ckpt["model"], strict=False)
+        mag_missing = [k for k in missing if "magnitude_head" in k]
+        other_missing = [k for k in missing if "magnitude_head" not in k]
+        print(f"  magnitude_head params newly initialized: {len(mag_missing)}")
+        if other_missing:
+            print(f"  WARNING: unexpected missing keys: {other_missing[:5]}"
+                  f"{' ...' if len(other_missing) > 5 else ''}")
+        if unexpected:
+            print(f"  WARNING: unexpected keys in checkpoint: {unexpected[:5]}"
+                  f"{' ...' if len(unexpected) > 5 else ''}")
+    else:
+        # If caller passed an already-warm lq_model, copy its weights in
+        # (strict=False so the fresh magnitude_head is left alone).
+        model.load_state_dict(lq_model.state_dict(), strict=False)
+
+    print(f"LQ VQVAE params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  Trainable (excl. parser): "
+          f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    # --- Dataset ---
+    dataset = FFHQPairedDataset(data_root=args.data_root, hq_only=False)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
+    print(f"Dataset: {len(dataset)} HQ/LQ pairs, {len(loader)} batches/epoch")
+
+    # --- Losses: same weights as Phase C ---
+    criterion = Stage1VQLoss(
+        lambda_per=args.lambda_per, lambda_dis=args.lambda_dis,
+        lambda_assoc=args.lambda_assoc,
+        vgg_pretrained=True,
+    ).to(device)
+
+    # Load Phase C discriminator for continuity
+    if os.path.exists(src_ckpt_path):
+        disc_ckpt = torch.load(src_ckpt_path, map_location=device, weights_only=False)
+        try:
+            criterion.discriminator.load_state_dict(disc_ckpt["discriminator"])
+            print("Loaded Phase C discriminator into Phase D.")
+        except RuntimeError:
+            print("  WARNING: Phase C discriminator incompatible, using fresh discriminator")
+
+    # Gradient checkpointing
+    if args.grad_ckpt:
+        n = _enable_gradient_checkpointing(model)
+        print(f"  Gradient checkpointing enabled on ~{n} blocks")
+
+    # AMP
+    use_amp = args.amp and device.type == "cuda"
+    scaler_g = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+    scaler_d = GradScaler("cuda", init_scale=2**12, growth_interval=4000) if use_amp else None
+    if use_amp:
+        print("  Mixed precision (AMP) enabled")
+
+    # Optimizers — fresh, lower LR (phase_d_lr)
+    gen_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer_g = torch.optim.Adam(gen_params, lr=args.phase_d_lr, betas=(0.5, 0.999))
+    optimizer_d = torch.optim.Adam(
+        criterion.discriminator.parameters(),
+        lr=args.phase_d_lr, betas=(0.5, 0.999),
+    )
+
+    # Cosine schedule over phase_d_epochs (no warmup — already warm)
+    scheduler_g = CosineAnnealingLR(optimizer_g, T_max=args.phase_d_epochs)
+    scheduler_d = CosineAnnealingLR(optimizer_d, T_max=args.phase_d_epochs)
+
+    # Resume
+    start_epoch = 0
+    ckpt_dir = os.path.join(args.ckpt_dir, "phase_d")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    if not args.fresh and os.path.exists(os.path.join(ckpt_dir, "latest.pt")):
+        ckpt = torch.load(os.path.join(ckpt_dir, "latest.pt"), map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        try:
+            criterion.discriminator.load_state_dict(ckpt["discriminator"])
+        except RuntimeError:
+            print("  WARNING: discriminator state dict incompatible, reinitializing")
+            optimizer_d = torch.optim.Adam(
+                criterion.discriminator.parameters(),
+                lr=args.phase_d_lr, betas=(0.5, 0.999),
+            )
+        if "optimizer_g" in ckpt:
+            optimizer_g.load_state_dict(ckpt["optimizer_g"])
+        if "optimizer_d" in ckpt:
+            optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        start_epoch = ckpt["epoch"] + 1
+        if "scheduler_g" in ckpt:
+            scheduler_g.load_state_dict(ckpt["scheduler_g"])
+        if "scheduler_d" in ckpt:
+            scheduler_d.load_state_dict(ckpt["scheduler_d"])
+        if scaler_g is not None and "scaler_g" in ckpt:
+            scaler_g.load_state_dict(ckpt["scaler_g"])
+        if scaler_d is not None and "scaler_d" in ckpt:
+            scaler_d.load_state_dict(ckpt["scaler_d"])
+        print(f"Resumed from epoch {start_epoch}")
+
+    # Training loop (re-uses train_one_epoch with phase='C' semantics —
+    # same loss structure, same association logic)
+    ckpt = None
+    for epoch in range(start_epoch, args.phase_d_epochs):
+        criterion.lambda_dis = args.lambda_dis  # no warmup
+
+        t0 = time.time()
+        avg_logs = train_one_epoch(
+            model, criterion, loader, optimizer_g, optimizer_d,
+            device, epoch, phase="C", hq_model=hq_model,
+            expire_every=args.phase_d_expire_every, log_every=args.log_every,
+            grad_clip_norm=args.grad_clip_norm,
+            use_amp=use_amp, scaler_g=scaler_g, scaler_d=scaler_d,
+            grad_accum_steps=args.grad_accum_steps,
+        )
+        scheduler_g.step()
+        scheduler_d.step()
+        elapsed = time.time() - t0
+        print(f"Phase D | Epoch {epoch} done in {elapsed:.0f}s | "
+              f"L1={avg_logs.get('l1',0):.4f} VQ={avg_logs.get('vq',0):.4f} "
+              f"assoc={avg_logs.get('association',0):.4f} "
+              f"mag={avg_logs.get('mag/mean',0):.3f}")
+
+        ckpt = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "discriminator": criterion.discriminator.state_dict(),
+            "optimizer_g": optimizer_g.state_dict(),
+            "optimizer_d": optimizer_d.state_dict(),
+            "scheduler_g": scheduler_g.state_dict(),
+            "scheduler_d": scheduler_d.state_dict(),
+        }
+        if scaler_g is not None:
+            ckpt["scaler_g"] = scaler_g.state_dict()
+        if scaler_d is not None:
+            ckpt["scaler_d"] = scaler_d.state_dict()
+        torch.save(ckpt, os.path.join(ckpt_dir, "latest.pt"))
+        if (epoch + 1) % args.save_every == 0:
+            torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"))
+
+    if ckpt is None:
+        ckpt = {
+            "epoch": start_epoch - 1,
+            "model": model.state_dict(),
+            "discriminator": criterion.discriminator.state_dict(),
+            "optimizer_g": optimizer_g.state_dict(),
+            "optimizer_d": optimizer_d.state_dict(),
+        }
+    torch.save(ckpt, os.path.join(ckpt_dir, "final.pt"))
+    print(f"Phase D complete. Saved to {ckpt_dir}/final.pt")
+
+    return model
+
+
 # ======================================================================
 # Main
 # ======================================================================
@@ -862,8 +1067,9 @@ def parse_args():
 
     # Phase selection
     parser.add_argument("--phase", type=str, default="all",
-                        choices=["A", "B", "C", "all"],
-                        help="Training phase: A (HQ), B (LQ), C (assoc), or all")
+                        choices=["A", "B", "C", "D", "all"],
+                        help="Training phase: A (HQ), B (LQ), C (assoc), "
+                             "D (magnitude-head fine-tune), or all")
 
     # Data
     parser.add_argument("--data_root", type=str, default="/projectnb/cs585/projects/craft/data/train",
@@ -894,6 +1100,12 @@ def parse_args():
     parser.add_argument("--hq_epochs", type=int, default=50, help="Phase A epochs")
     parser.add_argument("--lq_epochs", type=int, default=10, help="Phase B epochs")
     parser.add_argument("--assoc_epochs", type=int, default=10, help="Phase C epochs")
+    parser.add_argument("--phase_d_epochs", type=int, default=5,
+                        help="Phase D epochs (magnitude-head fine-tune)")
+    parser.add_argument("--phase_d_lr", type=float, default=5e-5,
+                        help="Phase D learning rate (lower than Phase C)")
+    parser.add_argument("--phase_d_expire_every", type=int, default=200,
+                        help="Phase D dead-code expiry interval (steps)")
 
     # Loss weights
     parser.add_argument("--lambda_per", type=float, default=1.0)
@@ -909,6 +1121,11 @@ def parse_args():
                         help="Phase A checkpoint (for Phases B, C)")
     parser.add_argument("--lq_ckpt", type=str, default="",
                         help="Phase B checkpoint (for Phase C)")
+    parser.add_argument("--phase_c_ckpt", type=str, default="",
+                        help="Phase C checkpoint (for Phase D)")
+    parser.add_argument("--use_magnitude_head", action="store_true",
+                        help="Enable per-position magnitude head in RegionAwareVQ "
+                             "(auto-enabled for Phase D)")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore existing checkpoints and start fresh")
     parser.add_argument("--phase_c_load_disc", action="store_true",
@@ -980,6 +1197,16 @@ def main():
 
     if args.phase == "C" or args.phase == "all":
         run_phase_c(args, device, hq_model=hq_model, lq_model=lq_model)
+
+        if args.phase == "all":
+            args.phase_c_ckpt = os.path.join(args.ckpt_dir, "phase_c", "final.pt")
+
+    if args.phase == "D" or args.phase == "all":
+        # Phase D builds its own RegionAwareVQ with use_magnitude_head=True
+        # and warm-starts from phase_c/final.pt via strict=False. We don't
+        # reuse the in-memory `lq_model`, because its quantizer was built
+        # without the magnitude head.
+        run_phase_d(args, device, hq_model=hq_model, lq_model=None)
 
     print("\nTraining complete!")
 

@@ -1,0 +1,42 @@
+
+========================================================================
+STEP 1 DIAGNOSTICS — CRAFT Stage 1 bottleneck
+========================================================================
+Images scored: 128
+
+Variant                       PSNR     SSIM       L1
+----------------------------------------------------
+hq_normal                19.88±1.70   0.6542   0.0750
+hq_bypass                16.85±1.57   0.6070   0.1101
+craft_normal             21.01±1.63   0.6384   0.0643
+craft_bypass             15.45±1.80   0.4917   0.1294
+hq_enc_craft_dec         15.62±1.67   0.5460   0.1287
+lq_enc_hq_dec            17.85±1.42   0.5957   0.0964
+
+Interpretation key:
+  VQ cost (HQ)    = hq_bypass − hq_normal        (dB lost to Phase A quantizer)
+  VQ cost (CRAFT) = craft_bypass − craft_normal  (dB lost to RegionAwareVQ)
+  Decoder ceiling = hq_enc_craft_dec              (CRAFT dec fed HQ features; bottleneck = CRAFT decoder)
+  Encoder ceiling = lq_enc_hq_dec                 (HQ dec fed LQ features; bottleneck = LQ encoder on degraded input)
+
+  →  HQ VQ cost:     -3.04 dB
+  →  CRAFT VQ cost:  -5.55 dB
+
+Code usage across full eval set (unique indices selected):
+region lvl   used /  total   frac     hits
+--------------------------------------------
+eyes     0    110 /    128  85.9%      502
+eyes     1     88 /    128  68.8%      502
+eyes     2     98 /    128  76.6%      502
+skin     0    256 /    256 100.0%     3649
+skin     1    256 /    256 100.0%     3649
+skin     2    256 /    256 100.0%     3649
+hair     0    508 /    512  99.2%     3895
+hair     1    507 /    512  99.0%     3895
+hair     2    510 /    512  99.6%     3895
+lips     0     64 /     64 100.0%      370
+lips     1     60 /     64  93.8%      370
+lips     2     63 /     64  98.4%      370
+bg       0    256 /    256 100.0%    24352
+bg       1    256 /    256 100.0%    24352
+bg       2    256 /    256 100.0%    24352

@@ -25,6 +25,9 @@ grad_clip_norm: 1.0      # max gradient norm (prevents NaN from GAN loss spikes)
 hq_epochs: 55           # Phase A
 lq_epochs: 20            # Phase B
 assoc_epochs: 10         # Phase C
+phase_d_epochs: 5        # Phase D (magnitude-head fine-tune)
+phase_d_lr: 5.0e-5       # Phase D LR (lower than Phase C's 1.44e-4)
+phase_d_expire_every: 200  # Phase D dead-code expiry interval
 
 # Loss weights
 lambda_per: 1.0

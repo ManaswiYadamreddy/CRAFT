@@ -1,0 +1,45 @@
+# CRAFT — Stage 1 + Stage 2 Python dependencies
+# Torch/torchvision are intentionally NOT pinned here; install them separately
+# (conda/pip with a CUDA-matching wheel) before running `pip install -r`.
+#
+# Tested combo:
+#   torch==2.4.0  torchvision==0.19.0  (cu121 wheels)
+#   Python 3.10
+
+# ---- Diffusion backbone + LoRA -----------------------------------------
+diffusers==0.27.2
+transformers==4.37.2
+peft==0.12.0
+accelerate==0.31.0
+tokenizers==0.15.2
+safetensors
+huggingface_hub
+
+# ---- Perceptual + identity losses --------------------------------------
+pyiqa                         # DISTS (Stage 2 perceptual)
+facexlib                      # ArcFace IR-50 (Stage 2 identity)
+basicsr                       # facexlib transitive dep
+
+# ---- Image / data ------------------------------------------------------
+pillow
+opencv-python
+imageio
+numpy
+scipy
+
+# ---- Misc utilities ----------------------------------------------------
+omegaconf
+einops
+ftfy
+sentencepiece
+tensorboard
+tqdm
+PyYAML
+
+# ---- Stage-1 wavelet + profiling (kept for parity with setup.sh) -------
+loralib
+pytorch-wavelets
+PyWavelets
+ptflops
+numba
+shapely

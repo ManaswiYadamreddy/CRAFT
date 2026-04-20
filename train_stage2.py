@@ -248,21 +248,36 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
+    # ----- dirs -----
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    os.makedirs(args.sample_dir, exist_ok=True)
+
     # ----- resume -----
-    start_iter = 0
+    # Priority: (1) explicit --resume path, (2) auto-resume from ckpt_dir/latest.pt
+    # unless --fresh is set. Stage 1 uses the same convention.
+    resume_path = ""
     if args.resume and os.path.exists(args.resume):
-        print(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        resume_path = args.resume
+    elif not args.fresh:
+        latest = os.path.join(args.ckpt_dir, "latest.pt")
+        if os.path.exists(latest):
+            resume_path = latest
+            print(f"Auto-resume: found {latest}")
+
+    start_iter = 0
+    if resume_path:
+        print(f"Resuming from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         missing, unexpected = _load_trainable_state(generator, ckpt["generator"])
-        print(f"  generator: missing={len(missing)}, unexpected={len(unexpected)}")
+        print(f"  generator trainable params: "
+              f"missing={len(missing)}, unexpected={len(unexpected)}")
         discriminator.load_state_dict(ckpt["discriminator"])
         optim_g.load_state_dict(ckpt["optim_g"])
         optim_d.load_state_dict(ckpt["optim_d"])
         start_iter = int(ckpt.get("iter", 0))
-
-    # ----- dirs -----
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    os.makedirs(args.sample_dir, exist_ok=True)
+        print(f"  resumed at iter {start_iter}")
+    else:
+        print("Starting fresh (no checkpoint to resume from)")
 
     # ----- main loop -----
     accum = defaultdict(float)
@@ -496,7 +511,10 @@ def parse_args():
     # ckpt/log
     p.add_argument("--ckpt_dir", type=str)
     p.add_argument("--sample_dir", type=str)
-    p.add_argument("--resume", type=str, default="")
+    p.add_argument("--resume", type=str, default="",
+                   help="Explicit checkpoint path to resume from. Overrides auto-resume.")
+    p.add_argument("--fresh", action="store_true",
+                   help="Ignore ckpt_dir/latest.pt and start from step 0.")
     p.add_argument("--save_every", type=int, default=5000)
     p.add_argument("--sample_every", type=int, default=2000)
     p.add_argument("--log_every", type=int, default=50)

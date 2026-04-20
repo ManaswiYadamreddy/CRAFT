@@ -1,38 +1,38 @@
 """
-train_concat.py — Concatenation-based text conditioning for OSDFace
+train_textcond.py — FiLM-based text conditioning for OSDFace (v3)
 
-Strategy: merge the pretrained OSDFace LoRA permanently into the SD 2.1 UNet
-base weights, then train a fresh LoRA (rank 32) on top of the merged model.
+Changes from v2:
+  1. Dual FiLM MLPs — separate film_pos_layers and film_na_layers so pos
+     and na learn genuinely different modulation directions. Fixes the
+     cancellation problem from v2 where a shared MLP produced γ_pos ≈ γ_na.
 
-The only architectural change vs. the original forward pass:
+  2. Preamble stripping — removes the shared quality prefix from pos and na
+     before CLIP encoding so CLIP sees only attribute-specific content.
+     Matches what inference does.
 
-    BEFORE:  encoder_hidden_states = visual_embeds                      # (B, 77,  1024)
-    AFTER:   encoder_hidden_states = cat([visual, pos, na], dim=1)      # (B, 231, 1024)
+  3. Gradient loss — penalizes blur by comparing image gradients between
+     predicted and target. Counteracts L1's tendency to encourage smoothing.
 
-Fixes vs previous version:
-  1. Prompt lookup handles _LQ filename suffix mismatch
-  2. Both pos and na prompts used (not just pos)
-  3. Preamble stripped before CLIP encoding
-  4. Hard error if prompt not found (no silent empty-string fallback)
-  5. Robust image glob replaces fragile character-class pattern
+  4. Contrastive FiLM loss — explicitly pushes the pos and na modulation
+     vectors apart so they learn meaningfully different directions.
 
-What is frozen vs trained:
-    VQ-VAE Encoder (VRE)    — FROZEN
-    TwoLayerConv1x1         — FROZEN
-    CLIP Text Encoder       — FROZEN
-    SD 2.1 VAE              — FROZEN
-    Merged UNet base        — FROZEN  (OSDFace LoRA baked in)
-    New LoRA (rank 32)      — TRAINED
+prompts.json format:
+    [
+      {"image": "0001.png",
+       "pos": "A high quality... in the description of young, big eyes",
+       "na":  "A high quality... not in the description of old, bald..."},
+      ...
+    ]
 
 Usage:
-    python train_concat.py \
-        --lq_dir /projectnb/cs585/projects/craft/data/train/LQ_images_512x512 \
-        --hq_dir /projectnb/cs585/projects/craft/data/train/images512x512 \
-        --prompts_json /projectnb/cs585/projects/craft/prompts_output_final.json \
+    python train_textcond.py \
+        --lq_dir data/train/lq \
+        --hq_dir data/train/hq \
+        --prompts_json data/train/prompts.json \
         --pretrained_model_name_or_path pretrained/sd21 \
         --img_encoder_weight pretrained/associate_2.ckpt \
         --ckpt_path pretrained \
-        --output_dir checkpoints/concat_v2 \
+        --output_dir checkpoints/textcond_v3 \
         --mixed_precision bf16 \
         --batch_size 4 \
         --max_train_steps 50000
@@ -40,14 +40,12 @@ Usage:
 
 import os
 import json
-import copy
 import glob
 import random
 import argparse
 import logging
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -63,17 +61,10 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_cosine_schedule_with_warmup
-from peft import LoraConfig, get_peft_model
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from lq_embed import vqvae_encoder, TwoLayerConv1x1
-try:
-    import lpips
-    LPIPS_AVAILABLE = True
-except ImportError:
-    LPIPS_AVAILABLE = False
-    print("WARNING: lpips not installed. Run: pip install lpips")
-    print("Perceptual loss will be disabled.")
+from text_conditioner import TextConditioner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -85,12 +76,13 @@ logger = logging.getLogger(__name__)
 
 def strip_preamble(text: str) -> str:
     """
-    Remove the shared quality prefix so CLIP sees only attribute content.
+    Remove the shared quality prefix from pos/na prompts so CLIP sees only
+    the attribute-specific content.
 
-    "A high quality... in the description of young, big eyes"
+    e.g. "A high quality... in the description of young, big eyes"
       →  "young, big eyes"
 
-    "A high quality... not in the description of old, bald"
+         "A high quality... not in the description of old, bald"
       →  "old, bald"
     """
     for marker in ["in the description of ", "not in the description of "]:
@@ -105,10 +97,6 @@ def strip_preamble(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def merge_lora_into_unet(args):
-    """
-    Permanently bakes the pretrained OSDFace LoRA into a fresh SD 2.1 UNet.
-    Returns a clean UNet with no adapters attached.
-    """
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet"
     )
@@ -129,7 +117,6 @@ def merge_lora_into_unet(args):
             W_B = state_dict[lora_b_key]
             orig = sd_unet[unet_key]
             processed_keys.update([key, lora_b_key])
-
             if orig.ndim == 4:
                 rank = W_A.shape[0]
                 out_ch, in_ch, kH, kW = orig.shape
@@ -139,7 +126,6 @@ def merge_lora_into_unet(args):
                 ).view(out_ch, in_ch, kH, kW)
             else:
                 delta = torch.mm(W_B, W_A)
-
             sd_unet[unet_key] = orig + alpha * delta
 
         elif "lora.up.weight" in key:
@@ -169,7 +155,6 @@ class FaceRestorationDataset(Dataset):
     def __init__(self, lq_dir, hq_dir, prompts_json, resolution=512):
         self.resolution = resolution
 
-        # Robust glob — handles all common extensions and casings
         def find_images(directory):
             exts = ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG",
                     "*.webp", "*.WEBP"]
@@ -191,22 +176,29 @@ class FaceRestorationDataset(Dataset):
         with open(prompts_json, "r") as f:
             raw = json.load(f)
 
-        # Index by multiple key variants to handle _LQ suffix mismatch.
-        # prompts.json uses "00020.png" but LQ files are "00020_LQ.png".
+        # Build lookup with multiple key variants so we match regardless of
+        # whether the LQ filename has a suffix like _LQ (e.g. 00020_LQ.png)
+        # but the prompts.json uses the clean name (e.g. 00020.png).
         self.prompts = {}
         for item in raw:
             entry = {
                 "pos": item.get("pos", ""),
                 "na":  item.get("na",  ""),
             }
-            name = item["image"]                     # e.g. "00020.png"
-            stem, ext = os.path.splitext(name)       # "00020", ".png"
+            name = item["image"]                    # e.g. "00020.png"
+            stem, ext = os.path.splitext(name)      # "00020", ".png"
             self.prompts[name]              = entry  # 00020.png
             self.prompts[f"{stem}_LQ{ext}"] = entry  # 00020_LQ.png
             self.prompts[f"{stem}_lq{ext}"] = entry  # 00020_lq.png
+            self.prompts[f"{stem}_HQ{ext}"] = entry  # 00020_HQ.png
 
-        # Verify matches — raise immediately if nothing matches
-        matched = sum(1 for lq in lq_paths if os.path.basename(lq) in self.prompts)
+        # Confirm a few keys so you can verify matching at startup
+        sample_keys = list(self.prompts.keys())[:8]
+        logger.info(f"Prompt keys sample: {sample_keys}")
+
+        # Verify at least one LQ file actually matches a prompt key
+        matched = sum(1 for lq, _ in zip(lq_paths, hq_paths)
+                      if os.path.basename(lq) in self.prompts)
         logger.info(f"Prompt matches: {matched}/{len(lq_paths)} LQ files have prompts")
         if matched == 0:
             raise ValueError(
@@ -240,26 +232,19 @@ class FaceRestorationDataset(Dataset):
         hq = self.transform(hq) * 2.0 - 1.0
 
         filename = os.path.basename(lq_path)
+        entry    = self.prompts.get(filename, {"pos": "", "na": ""})
 
-        if filename not in self.prompts:
-            raise KeyError(
-                f"No prompt found for '{filename}'. "
-                f"Check prompts.json contains a matching entry."
-            )
-        entry = self.prompts[filename]
-
-        # Strip preamble so CLIP sees only attribute content
         return {
             "lq":       lq,
             "hq":       hq,
-            "pos":      strip_preamble(entry["pos"]),
-            "na":       strip_preamble(entry["na"]),
+            "pos":      entry["pos"],
+            "na":       entry["na"],
             "filename": filename,
         }
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Loss functions
 # ---------------------------------------------------------------------------
 
 def get_x0_from_noise(sample, model_output, alphas_cumprod, timestep):
@@ -268,21 +253,74 @@ def get_x0_from_noise(sample, model_output, alphas_cumprod, timestep):
     return (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
 
 
+def gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Penalizes blur by comparing image gradients between prediction and target.
+    Operates in pixel space on decoded images (B, C, H, W) in [-1, 1].
+    L1 on gradients encourages the model to preserve edges and fine detail
+    rather than smoothing them away.
+    """
+    pred_dx   = pred[:, :, :, 1:]  - pred[:, :, :, :-1]
+    pred_dy   = pred[:, :, 1:, :]  - pred[:, :, :-1, :]
+    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    return F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
+
+
+def contrastive_film_loss(
+    conditioner: TextConditioner,
+    pos_embeds: torch.Tensor,
+    na_embeds: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Pushes pos and na FiLM modulations apart so they learn different directions.
+
+    For each block, we compute the (γ, β) vectors that film_pos and film_na
+    would produce for this batch, then minimize their cosine similarity.
+    This ensures the two MLPs diverge rather than collapsing to the same output.
+
+    Loss = mean cosine_similarity(pos_modulation, na_modulation)
+    Minimizing this → the two modulations point in different directions.
+    """
+    pos_pooled = pos_embeds.mean(dim=1).to(dtype)
+    na_pooled  = na_embeds.mean(dim=1).to(dtype)
+
+    total = torch.tensor(0.0, device=pos_embeds.device, dtype=dtype)
+    n = 0
+
+    for key in conditioner.film_pos_layers:
+        gp, bp = conditioner.film_pos_layers[key](pos_pooled)  # (B,1,d)
+        gn, bn = conditioner.film_na_layers[key](na_pooled)    # (B,1,d)
+
+        # Flatten to (B, 2d) and compute cosine similarity
+        vec_pos = torch.cat([gp, bp], dim=-1).squeeze(1)  # (B, 2d)
+        vec_na  = torch.cat([gn, bn], dim=-1).squeeze(1)  # (B, 2d)
+
+        # We want similarity to be LOW (vectors pointing in different directions)
+        sim  = F.cosine_similarity(vec_pos, vec_na, dim=-1).mean()
+        total = total + sim
+        n += 1
+
+    return total / max(n, 1)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
 def encode_text(prompts, tokenizer, text_encoder, device, weight_dtype):
     """
-    Encode prompts using the EOS token embedding rather than mean pooling.
+    Encode prompts using the EOS token embedding broadcast across sequence.
 
-    SD 2.1 uses the EOS (end-of-text) token position as the sentence summary
-    vector — this is what cross-attention was trained to condition on.
-    EOS embeddings are far more discriminative than mean-pooled hidden states:
-        mean-pool: pos vs empty ~0.91 (nearly identical)
-        EOS:       pos vs empty ~-0.04 (nearly orthogonal)
+    Mean-pooled CLIP hidden states have ~0.90 cosine similarity to empty
+    string — almost no discriminative signal. The EOS token embedding has
+    ~-0.04 similarity to empty string — nearly orthogonal, much stronger
+    signal for the FiLM layers to learn from.
 
-    Returns (B, 77, 1024) where the EOS embedding is broadcast across all
-    sequence positions so the shape is compatible with the concat approach.
-    For the concat path we only need the sequence to carry the text signal —
-    all 77 positions carry the same discriminative EOS vector.
+    Returns (B, 77, 1024) with the EOS embedding broadcast across all
+    sequence positions, compatible with the FiLM conditioning pathway.
     """
     input_ids = tokenizer(
         prompts,
@@ -295,25 +333,24 @@ def encode_text(prompts, tokenizer, text_encoder, device, weight_dtype):
     output = text_encoder(input_ids)
     hidden = output.last_hidden_state  # (B, 77, 1024)
 
-    # Find EOS token position for each item in the batch
-    # EOS is the first occurrence of tokenizer.eos_token_id in each sequence
-    eos_token_id = tokenizer.eos_token_id
-    eos_positions = (input_ids == eos_token_id).float().argmax(dim=1)  # (B,)
+    # EOS token position = first occurrence of eos_token_id per sequence
+    eos_positions = (input_ids == tokenizer.eos_token_id).float().argmax(dim=1)
 
     # Extract EOS embedding per batch item → (B, 1024)
-    eos_embeds = hidden[torch.arange(hidden.shape[0], device=device), eos_positions]
+    eos_embeds = hidden[
+        torch.arange(hidden.shape[0], device=device), eos_positions
+    ]
 
-    # Broadcast across sequence dimension → (B, 77, 1024)
-    # All positions carry the same discriminative sentence embedding
+    # Broadcast across sequence → (B, 77, 1024)
     eos_embeds = eos_embeds.unsqueeze(1).expand(-1, tokenizer.model_max_length, -1)
 
     return eos_embeds.to(weight_dtype)
 
 
-def save_checkpoint(unet, output_dir, step):
+def save_checkpoint(conditioner, output_dir, step):
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(ckpt_dir, exist_ok=True)
-    unet.save_pretrained(ckpt_dir)
+    conditioner.save(os.path.join(ckpt_dir, "text_conditioner.pth"))
     logger.info(f"Checkpoint saved → {ckpt_dir}")
 
 
@@ -326,7 +363,7 @@ def build_models(args, device):
                     "fp16": torch.float16,
                     "bf16": torch.bfloat16}[args.mixed_precision]
 
-    logger.info("Loading SD 2.1 scheduler and VAE...")
+    logger.info("Loading scheduler and VAE...")
     noise_scheduler = DDIMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
@@ -344,28 +381,18 @@ def build_models(args, device):
     ).to(device, dtype=weight_dtype)
     text_encoder.requires_grad_(False)
 
-    logger.info("Merging pretrained OSDFace LoRA into UNet base weights...")
+    logger.info("Merging OSDFace LoRA into UNet base weights...")
     unet = merge_lora_into_unet(args)
     unet.requires_grad_(False)
-
-    logger.info(f"Adding fresh LoRA (rank={args.lora_rank}) on merged UNet...")
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
-        lora_dropout=0.1,
-    )
-    unet = get_peft_model(unet, lora_config)
     unet.to(device, dtype=weight_dtype)
-
-    if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+    unet.eval()
 
     logger.info("Loading VQ-VAE image encoder (frozen)...")
     img_encoder = vqvae_encoder(args).to(device, dtype=weight_dtype)
     img_encoder.requires_grad_(False)
     img_encoder.eval()
 
+    logger.info("Loading TwoLayerConv1x1 projection (frozen)...")
     embedding_change = TwoLayerConv1x1(512, 1024)
     embedding_change.load_state_dict(
         torch.load(
@@ -377,17 +404,14 @@ def build_models(args, device):
     embedding_change.requires_grad_(False)
     embedding_change.eval()
 
-    # Perceptual loss network (VGG-based LPIPS)
-    if LPIPS_AVAILABLE and args.perceptual_loss_weight > 0:
-        logger.info("Loading LPIPS perceptual loss network (frozen)...")
-        loss_fn_perceptual = lpips.LPIPS(net='vgg').to(device)
-        loss_fn_perceptual.requires_grad_(False)
-    else:
-        loss_fn_perceptual = None
+    logger.info("Building TextConditioner (dual FiLM MLPs)...")
+    conditioner = TextConditioner(unet, text_dim=1024)
+    conditioner.register_hooks(unet)
+    conditioner.to(device, dtype=weight_dtype)
 
     return (
         noise_scheduler, vae, tokenizer, text_encoder,
-        unet, img_encoder, embedding_change, loss_fn_perceptual, weight_dtype,
+        unet, img_encoder, embedding_change, conditioner, weight_dtype,
     )
 
 
@@ -396,10 +420,10 @@ def build_models(args, device):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def eval_step(unet, vae, img_encoder, embedding_change,
+def eval_step(unet, vae, img_encoder, embedding_change, conditioner,
               tokenizer, text_encoder, noise_scheduler,
-              dataloader, device, weight_dtype, step):
-    unet.eval()
+              dataloader, device, weight_dtype, step, film_neg_weight):
+    conditioner.eval()
     alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
     timestep = 399
     total_loss, n = 0.0, 0
@@ -407,8 +431,8 @@ def eval_step(unet, vae, img_encoder, embedding_change,
     for batch in dataloader:
         lq  = batch["lq"].to(device, dtype=weight_dtype)
         hq  = batch["hq"].to(device, dtype=weight_dtype)
-        pos = batch["pos"]
-        na  = batch["na"]
+        pos = [strip_preamble(p) for p in batch["pos"]]
+        na  = [strip_preamble(p) for p in batch["na"]]
 
         visual_embeds = embedding_change(
             img_encoder(lq).reshape(lq.shape[0], 77, -1)
@@ -416,13 +440,16 @@ def eval_step(unet, vae, img_encoder, embedding_change,
         pos_embeds = encode_text(pos, tokenizer, text_encoder, device, weight_dtype)
         na_embeds  = encode_text(na,  tokenizer, text_encoder, device, weight_dtype)
 
-        # [visual | pos | na] → (B, 231, 1024)
-        prompt_embeds = torch.cat([visual_embeds, pos_embeds, na_embeds], dim=1)
-
         hq_latent = vae.encode(hq).latent_dist.sample() * vae.config.scaling_factor
         lq_latent = vae.encode(lq).latent_dist.sample() * vae.config.scaling_factor
 
-        model_pred = unet(lq_latent, timestep, encoder_hidden_states=prompt_embeds).sample
+        conditioner.set_text_embedding(pos_embeds, na_embeds, neg_weight=film_neg_weight)
+        model_pred = unet(
+            lq_latent, timestep,
+            encoder_hidden_states=visual_embeds,
+        ).sample
+        conditioner.clear_text_embedding()
+
         x0_pred = get_x0_from_noise(
             lq_latent.double(), model_pred.double(),
             alphas_cumprod.double(), timestep,
@@ -434,7 +461,7 @@ def eval_step(unet, vae, img_encoder, embedding_change,
             break
 
     logger.info(f"[Eval @ step {step}] L1 loss: {total_loss / max(n, 1):.5f}")
-    unet.train()
+    conditioner.train()
 
 
 # ---------------------------------------------------------------------------
@@ -448,12 +475,10 @@ def train(args):
 
     (
         noise_scheduler, vae, tokenizer, text_encoder,
-        unet, img_encoder, embedding_change, loss_fn_perceptual, weight_dtype,
+        unet, img_encoder, embedding_change, conditioner, weight_dtype,
     ) = build_models(args, device)
 
-    dataset = FaceRestorationDataset(
-        args.lq_dir, args.hq_dir, args.prompts_json
-    )
+    dataset = FaceRestorationDataset(args.lq_dir, args.hq_dir, args.prompts_json)
     train_loader = DataLoader(
         dataset, batch_size=args.batch_size,
         shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
@@ -463,9 +488,9 @@ def train(args):
         shuffle=False, num_workers=2, pin_memory=True,
     )
 
-    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    trainable_params = list(conditioner.parameters())
     total = sum(p.numel() for p in trainable_params)
-    logger.info(f"Trainable parameters: {total:,}  (UNet LoRA only)")
+    logger.info(f"Trainable parameters: {total:,}  (TextConditioner dual FiLM only)")
 
     optimizer = torch.optim.AdamW(
         trainable_params, lr=args.learning_rate,
@@ -476,23 +501,26 @@ def train(args):
         num_warmup_steps=args.warmup_steps,
         num_training_steps=args.max_train_steps,
     )
-    scaler   = torch.amp.GradScaler('cuda', enabled=(args.mixed_precision == "fp16"))
-    use_amp  = args.mixed_precision in ("fp16", "bf16")
+    scaler    = torch.amp.GradScaler('cuda', enabled=(args.mixed_precision == "fp16"))
+    use_amp   = args.mixed_precision in ("fp16", "bf16")
     amp_dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16
 
     alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
     timestep = 399  # fixed — OSDFace is a one-step diffusion model
 
-    unet.train()
+    unet.eval()
     img_encoder.eval()
     text_encoder.eval()
     embedding_change.eval()
     vae.eval()
+    conditioner.train()
 
     global_step = 0
     data_iter   = iter(train_loader)
 
     logger.info(f"Starting training for {args.max_train_steps} steps...")
+    logger.info(f"Loss weights — latent: 1.0 | pixel: {args.pixel_loss_weight} | "
+                f"grad: {args.grad_loss_weight} | contrastive: {args.contrastive_loss_weight}")
     pbar = tqdm(total=args.max_train_steps, desc="Training")
 
     while global_step < args.max_train_steps:
@@ -504,18 +532,18 @@ def train(args):
 
         lq  = batch["lq"].to(device, dtype=weight_dtype)
         hq  = batch["hq"].to(device, dtype=weight_dtype)
-        pos = batch["pos"]   # already preamble-stripped by dataset
-        na  = batch["na"]
+
+        # Strip preamble so CLIP sees only attribute content
+        pos = [strip_preamble(p) for p in batch["pos"]]
+        na  = [strip_preamble(p) for p in batch["na"]]
 
         with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
 
             with torch.no_grad():
-                # Visual tokens (frozen VRE + projection)
                 visual_embeds = embedding_change(
                     img_encoder(lq).reshape(lq.shape[0], 77, -1)
                 )  # (B, 77, 1024)
 
-                # Text tokens (frozen CLIP)
                 pos_embeds = encode_text(
                     pos, tokenizer, text_encoder, device, weight_dtype
                 )  # (B, 77, 1024)
@@ -523,7 +551,6 @@ def train(args):
                     na, tokenizer, text_encoder, device, weight_dtype
                 )  # (B, 77, 1024)
 
-                # VAE encode
                 hq_latent = (
                     vae.encode(hq).latent_dist.sample()
                     * vae.config.scaling_factor
@@ -533,19 +560,20 @@ def train(args):
                     * vae.config.scaling_factor
                 )
 
-            # Concatenate: [visual | pos | na] → (B, 231, 1024)
-            # visual first — preserves OSDFace's existing cross-attention prior
-            # pos second  — positive attribute guidance
-            # na last     — negative attribute description
-            prompt_embeds = torch.cat([visual_embeds, pos_embeds, na_embeds], dim=1)
+            # FiLM modulation — separate pos and na MLPs
+            conditioner.set_text_embedding(
+                pos_embeds, na_embeds,
+                neg_weight=args.film_neg_weight,
+            )
 
-            # UNet forward
             model_pred = unet(
                 lq_latent, timestep,
-                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states=visual_embeds,
             ).sample
 
-            # Loss
+            conditioner.clear_text_embedding()
+
+            # ── Reconstruction losses ──────────────────────────────────────
             x0_pred = get_x0_from_noise(
                 lq_latent.double(), model_pred.double(),
                 alphas_cumprod.double(), timestep,
@@ -553,28 +581,36 @@ def train(args):
 
             loss_latent = F.l1_loss(x0_pred, hq_latent)
 
-            if args.pixel_loss_weight > 0 or args.perceptual_loss_weight > 0:
+            if args.pixel_loss_weight > 0 or args.grad_loss_weight > 0:
                 with torch.no_grad():
                     x0_decoded = vae.decode(
                         x0_pred / vae.config.scaling_factor
                     ).sample.clamp(-1, 1)
 
-                loss_pixel = F.l1_loss(x0_decoded, hq) if args.pixel_loss_weight > 0                              else torch.tensor(0.0, device=device)
+                loss_pixel = F.l1_loss(x0_decoded, hq) if args.pixel_loss_weight > 0 \
+                             else torch.tensor(0.0, device=device)
 
-                # Perceptual loss — VGG-based LPIPS on decoded pixel images.
-                # Penalizes perceptual differences (blur, texture loss) that
-                # L1 in latent space cannot capture. Key for avoiding blurry outputs.
-                if args.perceptual_loss_weight > 0 and loss_fn_perceptual is not None:
-                    loss_perceptual = loss_fn_perceptual(x0_decoded, hq).mean()
-                else:
-                    loss_perceptual = torch.tensor(0.0, device=device)
+                # Gradient loss — penalizes blur by comparing image gradients
+                loss_grad = gradient_loss(x0_decoded, hq) if args.grad_loss_weight > 0 \
+                            else torch.tensor(0.0, device=device)
             else:
-                loss_pixel      = torch.tensor(0.0, device=device)
-                loss_perceptual = torch.tensor(0.0, device=device)
+                loss_pixel = torch.tensor(0.0, device=device)
+                loss_grad  = torch.tensor(0.0, device=device)
+
+            # ── Contrastive FiLM loss ──────────────────────────────────────
+            # Pushes pos and na modulations to learn different directions.
+            # Computed outside no_grad so gradients flow to FiLM params.
+            if args.contrastive_loss_weight > 0:
+                loss_contrast = contrastive_film_loss(
+                    conditioner, pos_embeds, na_embeds, amp_dtype
+                )
+            else:
+                loss_contrast = torch.tensor(0.0, device=device)
 
             loss = (loss_latent
                     + args.pixel_loss_weight      * loss_pixel
-                    + args.perceptual_loss_weight  * loss_perceptual)
+                    + args.grad_loss_weight        * loss_grad
+                    + args.contrastive_loss_weight * loss_contrast)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -587,25 +623,26 @@ def train(args):
         global_step += 1
         pbar.update(1)
         pbar.set_postfix({
-            "loss":  f"{loss.item():.4f}",
-            "l1":    f"{loss_latent.item():.4f}",
-            "pixel": f"{loss_pixel.item():.4f}",
-            "perc":  f"{loss_perceptual.item():.4f}",
-            "lr":    f"{lr_scheduler.get_last_lr()[0]:.2e}",
+            "loss":     f"{loss.item():.4f}",
+            "l1":       f"{loss_latent.item():.4f}",
+            "grad":     f"{loss_grad.item():.4f}",
+            "contrast": f"{loss_contrast.item():.4f}",
+            "lr":       f"{lr_scheduler.get_last_lr()[0]:.2e}",
         })
 
         if global_step % args.eval_every == 0:
             eval_step(
-                unet, vae, img_encoder, embedding_change,
+                unet, vae, img_encoder, embedding_change, conditioner,
                 tokenizer, text_encoder, noise_scheduler,
                 eval_loader, device, weight_dtype, global_step,
+                args.film_neg_weight,
             )
 
         if global_step % args.save_every == 0:
-            save_checkpoint(unet, args.output_dir, global_step)
+            save_checkpoint(conditioner, args.output_dir, global_step)
 
     pbar.close()
-    save_checkpoint(unet, args.output_dir, global_step)
+    save_checkpoint(conditioner, args.output_dir, global_step)
     logger.info("Training complete.")
 
 
@@ -626,30 +663,33 @@ def parse_args():
                    default="stabilityai/stable-diffusion-2-1-base")
     p.add_argument("--img_encoder_weight", default="pretrained/associate_2.ckpt")
     p.add_argument("--ckpt_path",    required=True)
-    p.add_argument("--output_dir",   default="checkpoints/concat_v2")
+    p.add_argument("--output_dir",   default="checkpoints/textcond_v3")
 
     # Pretrained OSDFace LoRA (for merging only)
     p.add_argument("--pretrained_lora_rank",  type=int,   default=16)
     p.add_argument("--pretrained_lora_alpha", type=float, default=16)
-
-    # New LoRA
-    p.add_argument("--lora_rank",    type=int,   default=32)
-    p.add_argument("--lora_alpha",   type=float, default=32)
 
     # Training
     p.add_argument("--batch_size",         type=int,   default=4)
     p.add_argument("--max_train_steps",    type=int,   default=50000)
     p.add_argument("--learning_rate",      type=float, default=1e-4)
     p.add_argument("--warmup_steps",       type=int,   default=500)
-    p.add_argument("--pixel_loss_weight",      type=float, default=0.1)
-    p.add_argument("--perceptual_loss_weight", type=float, default=0.1,
-                   help="Weight for LPIPS perceptual loss (default: 0.1). "
-                        "Requires: pip install lpips")
     p.add_argument("--mixed_precision",    type=str,
                    choices=["fp32", "fp16", "bf16"], default="bf16")
-    p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--eval_every",  type=int, default=2000)
     p.add_argument("--save_every",  type=int, default=5000)
+
+    # Loss weights
+    p.add_argument("--pixel_loss_weight",       type=float, default=0.1,
+                   help="Weight for pixel-space L1 loss (default: 0.1)")
+    p.add_argument("--grad_loss_weight",         type=float, default=0.1,
+                   help="Weight for gradient loss — penalizes blur (default: 0.1)")
+    p.add_argument("--contrastive_loss_weight",  type=float, default=0.05,
+                   help="Weight for contrastive FiLM loss — keeps pos/na apart (default: 0.05)")
+
+    # FiLM
+    p.add_argument("--film_neg_weight", type=float, default=0.5,
+                   help="Weight for na suppression in FiLM modulation (default: 0.5)")
 
     # VRE passthrough
     p.add_argument("--cat_prompt_embedding", action="store_true")

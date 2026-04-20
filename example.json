@@ -1,0 +1,18 @@
+"pos": "A high quality, high resolution, realistic and extremely detailed image in the description of young who has big eyes, no beard, straight hair.",
+"na": "A high quality, high resolution, realistic and extremely detailed image not in the description of a old man chubby who has black hair, blond hair, blurry, brown hair, eyeglasses, gray hair, heavy makeup, mouth slightly open, mustache, receding hairline, sideburns, smiling, wearing earrings, wearing hat, wearing necklace, big nose, wearing lipstick, wavy hair, big lips, bald, bangs, double chin.",
+
+
+
+for weight in -1.0 -0.7 -0.5 -0.3 0.0 0.5 0.9; do
+    python infer_textcond.py \
+        --input_image /projectnb/cs585/projects/craft/data/train/LQ_images_512x512/00020_LQ.png \
+        --output_dir results/sweep/swapped_weight_${weight} \
+        --prompts_json /tmp/swapped_00020.json \
+        --pretrained_model_name_or_path pretrained/sd21 \
+        --img_encoder_weight pretrained/associate_2.ckpt \
+        --ckpt_path pretrained \
+        --conditioner_path checkpoints/textcond_v3/checkpoint-40000/text_conditioner.pth \
+        --film_neg_weight ${weight} \
+        --gpu_ids 0 \
+        --mixed_precision fp16
+done

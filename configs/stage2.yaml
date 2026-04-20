@@ -30,7 +30,14 @@ stage1_ckpt:  /projectnb/cs585/projects/craft/checkpoints/phase_d/final.pt
 parser_ckpt:  /projectnb/cs585/projects/craft/pretrained/79999_iter.pth
 
 # ---------------------------------------------------------------- Diffusion backbone
-sd_model_id: stabilityai/stable-diffusion-2-1-base
+# NOTE: OSDFace used stabilityai/stable-diffusion-2-1-base, but Stability AI
+# removed that repo from HF. We use the sd-legacy SD 1.5 fork instead:
+#   - same 4×64×64 latent shape, same 0.18215 VAE scale, same epsilon pred
+#   - UNet cross_attention_dim = 768 (vs 1024 for SD 2.1-base), so
+#     prompt_ctx_dim must also be 768 below.
+#   - Smaller UNet (~860M → ~580M) → lower memory + ~15% faster.
+# To use a different backbone, change BOTH `sd_model_id` and `prompt_ctx_dim`.
+sd_model_id: sd-legacy/stable-diffusion-v1-5
 sd_cache_dir: ""               # HuggingFace cache dir (empty = default ~/.cache/huggingface)
 t_low: 999                     # T_L in OSDFace Eq. 2 (one-step from large-t)
 
@@ -40,8 +47,11 @@ lora_alpha: 16
 lora_dropout: 0.0
 lora_target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
 
-# Prompt projection (Linear 512 → 1024 + LayerNorm). Trainable.
-prompt_ctx_dim: 1024           # SD-2.1-base cross-attention context dim
+# Prompt projection (Linear 512 → cross_attention_dim + LayerNorm). Trainable.
+# MUST match `unet.config.cross_attention_dim` of the chosen SD backbone:
+#   SD 1.5          → 768   (CLIP ViT-L/14)
+#   SD 2.0 / 2.1    → 1024  (OpenCLIP-ViT-H)
+prompt_ctx_dim: 768
 
 # ---------------------------------------------------------------- Discriminator
 # D3SR-style latent discriminator with FiLM timestep conditioning. Operates

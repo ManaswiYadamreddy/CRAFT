@@ -13,7 +13,9 @@ peft==0.12.0
 accelerate==0.31.0
 tokenizers==0.15.2
 safetensors
-huggingface_hub
+# huggingface_hub >= 0.26 removed `cached_download`, which diffusers 0.27.2
+# imports unconditionally. Pin to the last 0.24.x that still works.
+huggingface_hub==0.24.7
 
 # ---- Perceptual + identity losses --------------------------------------
 pyiqa                         # DISTS (Stage 2 perceptual)

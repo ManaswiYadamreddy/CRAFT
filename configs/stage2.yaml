@@ -1,0 +1,102 @@
+# CRAFT Stage 2 — One-step diffusion generator + latent discriminator
+# ==========================================================================
+# Follows OSDFace (AAAI 2025) training setup as closely as possible:
+#   - 150,000 iterations, batch size 2
+#   - AdamW, lr 1e-4, bf16 AMP, grad clip 1.0
+#   - Losses: MSE + EA-DISTS + ArcFace ID + latent-space GAN  (Eqs. 12, 14–16)
+#   - Single-step denoising from t = T_L = 999   (OSDFace Eq. 2)
+#   - D3SR-style latent discriminator on forward-diffused latents
+#
+# Differences from the paper (documented in the Stage-2 plan):
+#   - No text prompt; conditioning is only the Stage-1 visual prompt
+#     (256-token embedding from the hierarchical Region-Aware VQ-VAE).
+#   - LoRA rank 16 on SD-2.1-base attention projections; everything else is
+#     frozen. VAE encoder/decoder are frozen; prompt Linear(512→1024)+LN is
+#     the only non-LoRA trainable module.
+#
+# Usage:
+#   python train_stage2.py --config configs/stage2.yaml
+
+# ---------------------------------------------------------------- Data
+data_root: /projectnb/cs585/projects/craft/data/train
+num_workers: 8
+image_size: 512                # FFHQ native after HQ/LQ preprocessing
+# Degradation is applied on-the-fly by the same pipeline used in Stage 1
+# (see data/ffhq.py) — I_L is produced by degrading I_H at load time.
+
+# ---------------------------------------------------------------- Stage-1 (frozen)
+# Phase-D Stage-1 checkpoint (LQ VRE with magnitude head) + face parser.
+stage1_ckpt:  /projectnb/cs585/projects/craft/checkpoints/phase_d/final.pt
+parser_ckpt:  /projectnb/cs585/projects/craft/pretrained/79999_iter.pth
+
+# ---------------------------------------------------------------- Diffusion backbone
+sd_model_id: stabilityai/stable-diffusion-2-1-base
+sd_cache_dir: ""               # HuggingFace cache dir (empty = default ~/.cache/huggingface)
+t_low: 999                     # T_L in OSDFace Eq. 2 (one-step from large-t)
+
+# LoRA adapter config (trainable inside UNet)
+lora_r: 16
+lora_alpha: 16
+lora_dropout: 0.0
+lora_target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
+
+# Prompt projection (Linear 512 → 1024 + LayerNorm). Trainable.
+prompt_ctx_dim: 1024           # SD-2.1-base cross-attention context dim
+
+# ---------------------------------------------------------------- Discriminator
+# D3SR-style latent discriminator with FiLM timestep conditioning. Operates
+# on F(z, t) = sqrt(ᾱ_t)·z + sqrt(1-ᾱ_t)·ε with t ∼ U{1, T-1} each step
+# (shared between real and fake within a step).
+disc_base_ch: 64               # widens to 128/256/512; ~8.4M params
+disc_t_embed_dim: 256
+disc_t_mlp_dim: 512
+
+# ---------------------------------------------------------------- Optimization
+total_iters: 150000            # OSDFace: 150K
+batch_size: 2                  # OSDFace: 2 (we have H200, could go higher but stay faithful)
+grad_accum_steps: 1            # effective batch = 2
+lr_g: 1.0e-4                   # AdamW LR for Stage-2 generator (prompt_proj + LoRA)
+lr_d: 1.0e-4                   # AdamW LR for the latent discriminator
+betas_g: [0.9, 0.999]
+betas_d: [0.5, 0.999]          # standard GAN discriminator betas
+weight_decay: 0.01
+grad_clip_norm: 1.0
+
+# LR schedule: linear warmup, then cosine decay to `min_lr_ratio * lr`.
+lr_schedule: cosine            # none | cosine
+warmup_iters: 1000
+min_lr_ratio: 0.1              # cosine floor = 0.1 * peak
+
+# GAN warmup: ramp λ_dis from 0 → lambda_dis over first `gan_warmup_iters`.
+gan_warmup_iters: 5000
+
+# Generator : Discriminator step ratio. 1:1 is the OSDFace default.
+d_update_every: 1              # update D every N generator steps
+
+# ---------------------------------------------------------------- Loss weights
+# OSDFace Eq. 12 (with a standard face-restoration ID weight of 0.1).
+lambda_mse: 1.0
+lambda_per: 1.0                # EA-DISTS = DISTS + Sobel(DISTS)
+lambda_id:  0.1                # ArcFace identity loss
+lambda_dis: 0.8                # adversarial
+enable_id:  true               # False skips ArcFace (useful for quick smoke tests)
+
+# ---------------------------------------------------------------- Memory
+amp: true                      # bf16 autocast
+amp_dtype: bfloat16            # bfloat16 | float16   (H200 → bf16)
+grad_ckpt: true                # gradient checkpointing on the SD UNet
+vae_slicing: true              # decoder slicing to reduce peak memory
+vae_tiling: false              # not needed at 512 on H200
+
+# ---------------------------------------------------------------- Checkpointing / logs
+ckpt_dir:  /projectnb/cs585/projects/craft/checkpoints_stage2
+sample_dir: /projectnb/cs585/projects/craft/samples_stage2
+resume:    ""                  # path to a prior ckpt; empty = fresh start
+save_every: 5000               # iterations
+sample_every: 2000             # dump a grid of (I_L, Î_H, I_H) for visual sanity
+log_every: 50                  # stdout/log cadence
+num_sample_images: 8           # batch size for validation samples
+
+# ---------------------------------------------------------------- Misc
+seed: 1234
+device: cuda

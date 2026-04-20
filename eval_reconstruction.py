@@ -171,17 +171,25 @@ def load_hq_model(ckpt_path: str, device, embed_dim=512, n_codes=1024):
 
 def load_craft_model(ckpt_path: str, device, parser_ckpt: str,
                      embed_dim=512, rq_levels=3):
-    """Load CRAFT LQ VQVAE (Phase C checkpoint)."""
+    """Load CRAFT LQ VQVAE (Phase C or Phase D checkpoint)."""
+    ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
+    # Phase C saves under 'model' key; handle both 'model' and 'lq_model'
+    key = "model" if "model" in ckpt else "lq_model"
+    state = ckpt[key]
+
+    # Auto-detect Phase D magnitude head from the checkpoint.
+    has_mag_head = any("magnitude_head" in k for k in state.keys())
+    if has_mag_head:
+        print("  Detected magnitude_head in checkpoint → Phase D model")
+
     ravq  = RegionAwareVQ(
         e_dim=embed_dim,
         n_levels=rq_levels,
         parser_ckpt=parser_ckpt,
+        use_magnitude_head=has_mag_head,
     )
     model = build_lq_vqvae(ravq, embed_dim=embed_dim)
-    ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
-    # Phase C saves under 'model' key; handle both 'model' and 'lq_model'
-    key = "model" if "model" in ckpt else "lq_model"
-    model.load_state_dict(ckpt[key])
+    model.load_state_dict(state)
     return model.to(device).eval()
 
 

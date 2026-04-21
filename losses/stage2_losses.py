@@ -79,19 +79,27 @@ class Stage2Loss(nn.Module):
         lambda_per: float = 1.0,
         lambda_id:  float = 0.1,
         lambda_dis: float = 0.8,
+        lambda_region_l1: float = 0.0,
         enable_id: bool = True,
+        t_max_dis: int | None = None,
     ):
         super().__init__()
         self.lambda_mse = float(lambda_mse)
         self.lambda_per = float(lambda_per)
         self.lambda_id  = float(lambda_id)
         self.lambda_dis = float(lambda_dis)
+        self.lambda_region_l1 = float(lambda_region_l1)
         self.enable_id = bool(enable_id)
 
         self.register_buffer(
             "alphas_cumprod", alphas_cumprod.clone().float(), persistent=False,
         )
         self.num_train_timesteps = int(alphas_cumprod.shape[0])
+        # Cap the adversarial-t upper bound. None/>=T falls back to T-1.
+        self.t_max_dis = (
+            self.num_train_timesteps if t_max_dis is None
+            else min(int(t_max_dis), self.num_train_timesteps)
+        )
 
         self.ea_dists = EADists()
         self.arcface = ArcFaceID() if enable_id else None
@@ -105,9 +113,13 @@ class Stage2Loss(nn.Module):
         return ((x_11 + 1.0) * 0.5).clamp(0.0, 1.0)
 
     def _sample_t(self, batch_size: int, device) -> torch.Tensor:
-        """t ∼ U{1, ..., T-1}. Index 0 corresponds to ᾱ₀≈1 (clean), skip it."""
+        """
+        t ∼ U{1, ..., t_max_dis - 1}. Index 0 corresponds to ᾱ₀≈1 (clean), skip it.
+        Capped by t_max_dis (default T) — keeping D in the informative-noise
+        regime prevents near-pure-noise samples at t≈T from polluting gradients.
+        """
         return torch.randint(
-            low=1, high=self.num_train_timesteps,
+            low=1, high=self.t_max_dis,
             size=(batch_size,), device=device, dtype=torch.long,
         )
 
@@ -121,15 +133,22 @@ class Stage2Loss(nn.Module):
         I_hat_H_11: torch.Tensor,
         z_hat_H: torch.Tensor,
         discriminator: nn.Module,
+        region_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        OSDFace Eq. 12, with L_G from Eq. 15.
+        OSDFace Eq. 12, with L_G from Eq. 15, plus optional region-L1 term.
 
         L_gen = λ_MSE · MSE(I_H, Î_H)
               + λ_per · L_EA-DISTS(I_H, Î_H)
               + λ_ID  · L_ID(I_H, Î_H)
               + λ_dis · L_G
+              + λ_region · L1_region(I_H, Î_H)  (if region_mask and λ_region > 0)
         L_G = −E_t [ log D( F(ẑ_H, t) ) ]
+
+        Args:
+            region_mask: optional (B, 1, H, W) float mask in [0, 1] selecting
+                         pixels to weight in the region-L1 term. When provided
+                         and lambda_region_l1 > 0, adds a masked-mean L1 loss.
         """
         logs: dict = {}
 
@@ -151,6 +170,17 @@ class Stage2Loss(nn.Module):
             id_loss = torch.zeros((), device=mse.device, dtype=mse.dtype)
             logs["id"] = id_loss
 
+        # -- region-weighted L1 (optional) --
+        if self.lambda_region_l1 > 0 and region_mask is not None:
+            abs_err = (I_hat_H_11 - I_H_11).abs().mean(dim=1, keepdim=True)  # (B,1,H,W)
+            region_mask = region_mask.to(abs_err.dtype)
+            denom = region_mask.sum().clamp_min(1.0)
+            region_l1 = (abs_err * region_mask).sum() / denom
+            logs["region_l1"] = region_l1.detach()
+        else:
+            region_l1 = torch.zeros((), device=mse.device, dtype=mse.dtype)
+            logs["region_l1"] = region_l1
+
         # -- adversarial G loss on latent --
         B = z_hat_H.shape[0]
         t = self._sample_t(B, z_hat_H.device)
@@ -164,10 +194,58 @@ class Stage2Loss(nn.Module):
             self.lambda_mse * mse
             + self.lambda_per * ea
             + self.lambda_id * id_loss
+            + self.lambda_region_l1 * region_l1
             + self.lambda_dis * gan_g
         )
         logs["total_gen"] = total.detach()
         return total, logs
+
+    # ------------------------------------------------------------------
+    # R1 gradient penalty on discriminator (Mescheder 2018)
+    # ------------------------------------------------------------------
+
+    def r1_penalty(
+        self,
+        z_H: torch.Tensor,
+        discriminator: nn.Module,
+        gamma: float = 10.0,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        R1 = γ/2 · E [ ‖∇_z D(F(z_real, t))‖² ]
+
+        Computed in fp32 outside any autocast context for numerical stability
+        of the second-derivative path (create_graph=True). Call this every
+        `r1_every` D updates to amortize cost — the penalty is ~2× more
+        expensive than a vanilla D step.
+
+        Args:
+            z_H:  real HQ latent (no grad required from caller).
+            discriminator: the D network (already spectral-normalized).
+            gamma: R1 coefficient. 0 disables (returns 0 loss).
+
+        Returns:
+            (penalty_tensor, logs). Caller should `.backward()` this directly
+            on the D optimizer — D params will receive gradients; z_H will not.
+        """
+        if gamma <= 0:
+            zero = torch.zeros((), device=z_H.device, dtype=torch.float32)
+            return zero, {"r1": zero.detach()}
+
+        B = z_H.shape[0]
+        t = self._sample_t(B, z_H.device)
+        with torch.autocast(device_type=z_H.device.type, enabled=False):
+            z_real = z_H.detach().float().requires_grad_(True)
+            eps = torch.randn_like(z_real)
+            ab = self.alphas_cumprod[t].to(z_real.dtype).view(-1, 1, 1, 1)
+            z_noisy = ab.sqrt() * z_real + (1.0 - ab).sqrt() * eps
+            d_logit = discriminator(z_noisy, t).float()
+            (grads,) = torch.autograd.grad(
+                outputs=d_logit.sum(), inputs=z_real,
+                create_graph=True, retain_graph=False,
+            )
+            penalty = grads.pow(2).flatten(1).sum(dim=1).mean()
+            r1 = 0.5 * gamma * penalty
+        return r1, {"r1": r1.detach(), "r1_raw": penalty.detach()}
 
     # ------------------------------------------------------------------
     # Discriminator loss

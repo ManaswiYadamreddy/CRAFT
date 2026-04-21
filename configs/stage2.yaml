@@ -66,7 +66,7 @@ total_iters: 150000            # OSDFace: 150K
 batch_size: 2                  # OSDFace: 2 (we have H200, could go higher but stay faithful)
 grad_accum_steps: 1            # effective batch = 2
 lr_g: 1.0e-4                   # AdamW LR for Stage-2 generator (prompt_proj + LoRA)
-lr_d: 1.0e-4                   # AdamW LR for the latent discriminator
+lr_d: 4.0e-5                   # AdamW LR for D (TTUR 2.5:1 vs G — slows D to prevent dominance)
 betas_g: [0.9, 0.999]
 betas_d: [0.5, 0.999]          # standard GAN discriminator betas
 weight_decay: 0.01
@@ -78,18 +78,38 @@ warmup_iters: 1000
 min_lr_ratio: 0.1              # cosine floor = 0.1 * peak
 
 # GAN warmup: ramp λ_dis from 0 → lambda_dis over first `gan_warmup_iters`.
-gan_warmup_iters: 5000
+# Extended from 5K → 20K to give reconstruction losses time to anchor the
+# generator before the adversarial term reaches full strength.
+gan_warmup_iters: 20000
 
 # Generator : Discriminator step ratio. 1:1 is the OSDFace default.
 d_update_every: 1              # update D every N generator steps
+
+# Adversarial timestep range. Sample t ∼ U{1, t_max_dis-1} for F(z, t) fed to D.
+# Restricting to the low-noise half keeps D in a regime with real signal;
+# t close to T makes F(z,t) nearly pure noise → D gradient becomes noise.
+t_max_dis: 500                 # was implicit T=1000; U{1, 499}
+
+# R1 gradient penalty on D (Mescheder 2018). γ/2 · ‖∇_z D(F(z_real, t))‖² on
+# real latents, applied every `r1_every` D steps to amortize cost. Set γ=0 to
+# disable. γ=10 is the ADM / StyleGAN default and is near-free insurance
+# against D becoming too sharp.
+r1_gamma: 10.0
+r1_every: 16
 
 # ---------------------------------------------------------------- Loss weights
 # OSDFace Eq. 12 (with a standard face-restoration ID weight of 0.1).
 lambda_mse: 1.0
 lambda_per: 1.0                # EA-DISTS = DISTS + Sobel(DISTS)
 lambda_id:  0.1                # ArcFace identity loss
-lambda_dis: 0.8                # adversarial
+lambda_dis: 0.3                # adversarial — reduced from 0.8 to curb D dominance
 enable_id:  true               # False skips ArcFace (useful for quick smoke tests)
+
+# Region-weighted L1 on high-failure regions (observed: mouth/philtrum).
+# L = λ_region · mean_over_masked_px |Î_H − I_H|  (L1, hard mask, 16×16→512 NN up).
+# Set λ_region=0 to disable. Requires pre-computed BiSeNet masks in dataset.
+lambda_region_l1: 0.3
+region_l1_regions: ["lips", "eyes"]
 
 # ---------------------------------------------------------------- Memory
 amp: true                      # bf16 autocast

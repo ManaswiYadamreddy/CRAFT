@@ -58,6 +58,32 @@ def _indices_to_masks(region_indices: torch.Tensor, device) -> dict:
     return {name: region_indices == idx for idx, name in enumerate(REGION_NAMES)}
 
 
+def _region_mask_512(
+    region_indices: torch.Tensor,
+    region_names: list[str],
+    device,
+    size: int = 512,
+) -> torch.Tensor:
+    """
+    Build a (B, 1, size, size) float mask that is 1 inside any of `region_names`
+    and 0 elsewhere. `region_indices` is the (B, 16, 16) int64 label grid from
+    the dataset — we NN-upsample (no blurring of boundaries) to image size.
+    """
+    region_indices = region_indices.to(device)
+    idxs = [REGION_NAMES.index(n) for n in region_names if n in REGION_NAMES]
+    if not idxs:
+        return torch.zeros(
+            (region_indices.shape[0], 1, size, size),
+            device=device, dtype=torch.float32,
+        )
+    mask = torch.zeros_like(region_indices, dtype=torch.bool)
+    for i in idxs:
+        mask = mask | (region_indices == i)
+    mask = mask.unsqueeze(1).float()                             # (B, 1, 16, 16)
+    mask = F.interpolate(mask, size=(size, size), mode="nearest")
+    return mask
+
+
 def _cycle(loader):
     """Infinite iterator over `loader`, re-shuffling at epoch boundaries."""
     while True:
@@ -234,8 +260,16 @@ def train(args):
         lambda_per=args.lambda_per,
         lambda_id=args.lambda_id,
         lambda_dis=args.lambda_dis,  # full value; we ramp externally via gan_warmup
+        lambda_region_l1=args.lambda_region_l1,
         enable_id=args.enable_id,
+        t_max_dis=args.t_max_dis,
     ).to(device)
+    print(
+        f"Stage2Loss | λ_mse={args.lambda_mse} λ_per={args.lambda_per} "
+        f"λ_id={args.lambda_id} λ_dis={args.lambda_dis} "
+        f"λ_region={args.lambda_region_l1} (regions={args.region_l1_regions}) | "
+        f"t_max_dis={args.t_max_dis} | r1_γ={args.r1_gamma} every={args.r1_every}"
+    )
 
     # ----- optimizers -----
     gen_params = [p for p in generator.parameters() if p.requires_grad]
@@ -310,6 +344,16 @@ def train(args):
         I_L_01 = batch["lq_01"].to(device, non_blocking=True)
         I_H = batch["hq"].to(device, non_blocking=True)
         masks = _indices_to_masks(batch["lq_mask"], device) if "lq_mask" in batch else None
+        # Region mask (512×512 float) for the region-L1 term. Prefer HQ labels
+        # if present, else LQ; else None (term is a no-op at λ=0 anyway).
+        region_mask = None
+        if args.lambda_region_l1 > 0 and args.region_l1_regions:
+            hq_idx = batch.get("hq_mask", batch.get("lq_mask"))
+            if hq_idx is not None:
+                region_mask = _region_mask_512(
+                    hq_idx, list(args.region_l1_regions), device,
+                    size=args.image_size,
+                )
 
         # ================================================================
         # Generator step
@@ -323,6 +367,7 @@ def train(args):
                 I_hat_H_11=I_hat,
                 z_hat_H=z_hat,
                 discriminator=discriminator,
+                region_mask=region_mask,
             )
 
         if torch.isnan(g_loss) or torch.isinf(g_loss):
@@ -359,6 +404,23 @@ def train(args):
                 print(f"  [iter {it}] NaN/Inf in d_loss — skipping D update")
             else:
                 d_loss.backward()
+
+                # -- R1 gradient penalty on D (every r1_every steps, fp32) --
+                # Separate backward pass; penalty gradients accumulate into
+                # D.grad alongside the main D loss before the optimizer step.
+                if (
+                    args.r1_gamma > 0
+                    and args.r1_every > 0
+                    and (it % args.r1_every) == 0
+                ):
+                    r1_loss, r1_logs = loss_module.r1_penalty(
+                        z_H=z_H.detach(), discriminator=discriminator,
+                        gamma=args.r1_gamma,
+                    )
+                    if not (torch.isnan(r1_loss) or torch.isinf(r1_loss)):
+                        r1_loss.backward()
+                        d_logs.update(r1_logs)
+
                 if args.grad_clip_norm > 0:
                     d_gnorm = torch.nn.utils.clip_grad_norm_(
                         discriminator.parameters(), args.grad_clip_norm,
@@ -383,8 +445,8 @@ def train(args):
                 f"{rate:.2f} it/s | λ_dis={loss_module.lambda_dis:.3f} | "
                 f"lr={optim_g.param_groups[0]['lr']:.1e}"
             )
-            for k in ("mse", "ea_dists", "id", "gan_g", "total_gen",
-                      "d_real", "d_fake"):
+            for k in ("mse", "ea_dists", "id", "region_l1", "gan_g",
+                      "total_gen", "d_real", "d_fake", "r1"):
                 if k in accum:
                     msg += f" | {k}={accum[k]/max(g_step,1):+.4f}"
             if accum.get("g_gnorm_cnt", 0) > 0:
@@ -488,12 +550,22 @@ def parse_args():
     p.add_argument("--min_lr_ratio", type=float, default=0.1)
     p.add_argument("--gan_warmup_iters", type=int, default=5000)
     p.add_argument("--d_update_every", type=int, default=1)
+    p.add_argument("--t_max_dis", type=int, default=1000,
+                   help="Adversarial t sampled from U{1, t_max_dis-1}.")
+    p.add_argument("--r1_gamma", type=float, default=0.0,
+                   help="R1 gradient penalty coefficient on D (0 = disabled).")
+    p.add_argument("--r1_every", type=int, default=16,
+                   help="Apply R1 every N D steps (lazy regularization).")
 
     # losses
     p.add_argument("--lambda_mse", type=float, default=1.0)
     p.add_argument("--lambda_per", type=float, default=1.0)
     p.add_argument("--lambda_id",  type=float, default=0.1)
     p.add_argument("--lambda_dis", type=float, default=0.8)
+    p.add_argument("--lambda_region_l1", type=float, default=0.0,
+                   help="Weight for region-L1 term on parsed regions.")
+    p.add_argument("--region_l1_regions", nargs="+", default=["lips", "eyes"],
+                   help="BiSeNet region names to include in the region-L1 mask.")
     p.add_argument("--enable_id", action="store_true")
     p.add_argument("--no_id", dest="enable_id", action="store_false")
     p.set_defaults(enable_id=True)

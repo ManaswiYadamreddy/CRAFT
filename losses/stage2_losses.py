@@ -239,9 +239,12 @@ class Stage2Loss(nn.Module):
             ab = self.alphas_cumprod[t].to(z_real.dtype).view(-1, 1, 1, 1)
             z_noisy = ab.sqrt() * z_real + (1.0 - ab).sqrt() * eps
             d_logit = discriminator(z_noisy, t).float()
+            # retain_graph defaults to create_graph=True, so the forward-pass
+            # saved tensors stay alive for the subsequent r1.backward() which
+            # traverses the higher-order graph created here.
             (grads,) = torch.autograd.grad(
                 outputs=d_logit.sum(), inputs=z_real,
-                create_graph=True, retain_graph=False,
+                create_graph=True,
             )
             penalty = grads.pow(2).flatten(1).sum(dim=1).mean()
             r1 = 0.5 * gamma * penalty

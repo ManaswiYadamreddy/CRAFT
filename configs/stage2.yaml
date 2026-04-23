@@ -1,0 +1,132 @@
+# CRAFT Stage 2 — One-step diffusion generator + latent discriminator
+# ==========================================================================
+# Follows OSDFace (AAAI 2025) training setup as closely as possible:
+#   - 150,000 iterations, batch size 2
+#   - AdamW, lr 1e-4, bf16 AMP, grad clip 1.0
+#   - Losses: MSE + EA-DISTS + ArcFace ID + latent-space GAN  (Eqs. 12, 14–16)
+#   - Single-step denoising from t = T_L = 999   (OSDFace Eq. 2)
+#   - D3SR-style latent discriminator on forward-diffused latents
+#
+# Differences from the paper (documented in the Stage-2 plan):
+#   - No text prompt; conditioning is only the Stage-1 visual prompt
+#     (256-token embedding from the hierarchical Region-Aware VQ-VAE).
+#   - LoRA rank 16 on SD-2.1-base attention projections; everything else is
+#     frozen. VAE encoder/decoder are frozen; prompt Linear(512→1024)+LN is
+#     the only non-LoRA trainable module.
+#
+# Usage:
+#   python train_stage2.py --config configs/stage2.yaml
+
+# ---------------------------------------------------------------- Data
+data_root: /projectnb/cs585/projects/craft/data/train
+num_workers: 8
+image_size: 512                # FFHQ native after HQ/LQ preprocessing
+# Degradation is applied on-the-fly by the same pipeline used in Stage 1
+# (see data/ffhq.py) — I_L is produced by degrading I_H at load time.
+
+# ---------------------------------------------------------------- Stage-1 (frozen)
+# Phase-D Stage-1 checkpoint (LQ VRE with magnitude head) + face parser.
+stage1_ckpt:  /projectnb/cs585/projects/craft/checkpoints/phase_d/final.pt
+parser_ckpt:  /projectnb/cs585/projects/craft/pretrained/79999_iter.pth
+
+# ---------------------------------------------------------------- Diffusion backbone
+# NOTE: OSDFace used stabilityai/stable-diffusion-2-1-base, but Stability AI
+# removed that repo from HF. We use the sd-legacy SD 1.5 fork instead:
+#   - same 4×64×64 latent shape, same 0.18215 VAE scale, same epsilon pred
+#   - UNet cross_attention_dim = 768 (vs 1024 for SD 2.1-base), so
+#     prompt_ctx_dim must also be 768 below.
+#   - Smaller UNet (~860M → ~580M) → lower memory + ~15% faster.
+# To use a different backbone, change BOTH `sd_model_id` and `prompt_ctx_dim`.
+sd_model_id: sd-legacy/stable-diffusion-v1-5
+sd_cache_dir: ""               # HuggingFace cache dir (empty = default ~/.cache/huggingface)
+t_low: 999                     # T_L in OSDFace Eq. 2 (one-step from large-t)
+
+# LoRA adapter config (trainable inside UNet)
+lora_r: 16
+lora_alpha: 16
+lora_dropout: 0.0
+lora_target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
+
+# Prompt projection (Linear 512 → cross_attention_dim + LayerNorm). Trainable.
+# MUST match `unet.config.cross_attention_dim` of the chosen SD backbone:
+#   SD 1.5          → 768   (CLIP ViT-L/14)
+#   SD 2.0 / 2.1    → 1024  (OpenCLIP-ViT-H)
+prompt_ctx_dim: 768
+
+# ---------------------------------------------------------------- Discriminator
+# D3SR-style latent discriminator with FiLM timestep conditioning. Operates
+# on F(z, t) = sqrt(ᾱ_t)·z + sqrt(1-ᾱ_t)·ε with t ∼ U{1, T-1} each step
+# (shared between real and fake within a step).
+disc_base_ch: 64               # widens to 128/256/512; ~8.4M params
+disc_t_embed_dim: 256
+disc_t_mlp_dim: 512
+
+# ---------------------------------------------------------------- Optimization
+total_iters: 150000            # OSDFace: 150K
+batch_size: 2                  # OSDFace: 2 (we have H200, could go higher but stay faithful)
+grad_accum_steps: 1            # effective batch = 2
+lr_g: 1.0e-4                   # AdamW LR for Stage-2 generator (prompt_proj + LoRA)
+lr_d: 4.0e-5                   # AdamW LR for D (TTUR 2.5:1 vs G — slows D to prevent dominance)
+betas_g: [0.9, 0.999]
+betas_d: [0.5, 0.999]          # standard GAN discriminator betas
+weight_decay: 0.01
+grad_clip_norm: 1.0
+
+# LR schedule: linear warmup, then cosine decay to `min_lr_ratio * lr`.
+lr_schedule: cosine            # none | cosine
+warmup_iters: 1000
+min_lr_ratio: 0.1              # cosine floor = 0.1 * peak
+
+# GAN warmup: ramp λ_dis from 0 → lambda_dis over first `gan_warmup_iters`.
+# Extended from 5K → 20K to give reconstruction losses time to anchor the
+# generator before the adversarial term reaches full strength.
+gan_warmup_iters: 20000
+
+# Generator : Discriminator step ratio. 1:1 is the OSDFace default.
+d_update_every: 1              # update D every N generator steps
+
+# Adversarial timestep range. Sample t ∼ U{1, t_max_dis-1} for F(z, t) fed to D.
+# Restricting to the low-noise half keeps D in a regime with real signal;
+# t close to T makes F(z,t) nearly pure noise → D gradient becomes noise.
+t_max_dis: 500                 # was implicit T=1000; U{1, 499}
+
+# R1 gradient penalty on D (Mescheder 2018). γ/2 · ‖∇_z D(F(z_real, t))‖² on
+# real latents, applied every `r1_every` D steps to amortize cost. Set γ=0 to
+# disable. γ=10 is the ADM / StyleGAN default and is near-free insurance
+# against D becoming too sharp.
+r1_gamma: 10.0
+r1_every: 16
+
+# ---------------------------------------------------------------- Loss weights
+# OSDFace Eq. 12 (with a standard face-restoration ID weight of 0.1).
+lambda_mse: 1.0
+lambda_per: 1.0                # EA-DISTS = DISTS + Sobel(DISTS)
+lambda_id:  0.1                # ArcFace identity loss
+lambda_dis: 0.3                # adversarial — reduced from 0.8 to curb D dominance
+enable_id:  true               # False skips ArcFace (useful for quick smoke tests)
+
+# Region-weighted L1 on high-failure regions (observed: mouth/philtrum).
+# L = λ_region · mean_over_masked_px |Î_H − I_H|  (L1, hard mask, 16×16→512 NN up).
+# Set λ_region=0 to disable. Requires pre-computed BiSeNet masks in dataset.
+lambda_region_l1: 0.3
+region_l1_regions: ["lips", "eyes"]
+
+# ---------------------------------------------------------------- Memory
+amp: true                      # bf16 autocast
+amp_dtype: bfloat16            # bfloat16 | float16   (H200 → bf16)
+grad_ckpt: true                # gradient checkpointing on the SD UNet
+vae_slicing: true              # decoder slicing to reduce peak memory
+vae_tiling: false              # not needed at 512 on H200
+
+# ---------------------------------------------------------------- Checkpointing / logs
+ckpt_dir:  /projectnb/cs585/projects/craft/checkpoints_stage2
+sample_dir: /projectnb/cs585/projects/craft/samples_stage2
+resume:    ""                  # path to a prior ckpt; empty = fresh start
+save_every: 5000               # iterations
+sample_every: 2000             # dump a grid of (I_L, Î_H, I_H) for visual sanity
+log_every: 50                  # stdout/log cadence
+num_sample_images: 8           # batch size for validation samples
+
+# ---------------------------------------------------------------- Misc
+seed: 1234
+device: cuda

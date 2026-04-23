@@ -1,0 +1,111 @@
+# OSDFace Stage 2 baseline — One-step diffusion generator + latent discriminator
+# ==========================================================================
+# Mirrors OSDFace (AAAI 2025) training as closely as possible, using an
+# OSDFace-style Stage 1 (GlobalVQ, no region parsing) for the visual prompt.
+#
+# Shares the Stage-2 loss module, latent discriminator, and training-stability
+# fixes with CRAFT (TTUR, extended GAN warmup, R1, restricted adversarial t),
+# so a CRAFT-vs-OSDFace comparison isolates the Stage-1 prompt encoder.
+#
+# Key differences from configs/stage2.yaml:
+#   - Stage-1 = OSDFace LQ VQ-VAE (GlobalVQ). No face parser, no masks.
+#   - No region-weighted L1 loss (OSDFace does not use regions).
+#   - Separate ckpt/sample dirs so both baselines can coexist.
+#
+# Usage:
+#   python train_stage2_osdface.py --config configs/stage2_osdface.yaml
+
+# ---------------------------------------------------------------- Data
+data_root: /projectnb/cs585/projects/craft/data/train
+num_workers: 8
+image_size: 512
+
+# ---------------------------------------------------------------- Stage-1 (frozen)
+# OSDFace Stage-1 LQ checkpoint (written by train_osdface_stage1.py).
+# Use the Phase-C ckpt if available (λ_assoc=1); otherwise Phase-B works too.
+stage1_ckpt: /projectnb/cs585/projects/craft/checkpoints_osdface/phase_c/final.pt
+
+# Stage-1 architecture parameters (must match what you trained).
+stage1_n_codes: 1024           # OSDFace default codebook size
+stage1_embed_dim: 512          # also the visual-prompt channel dim
+
+# ---------------------------------------------------------------- Diffusion backbone
+sd_model_id: sd-legacy/stable-diffusion-v1-5
+sd_cache_dir: ""
+t_low: 999                     # T_L in OSDFace Eq. 2
+
+# LoRA adapter config (trainable inside UNet)
+lora_r: 16
+lora_alpha: 16
+lora_dropout: 0.0
+lora_target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
+
+# Prompt projection: Linear(stage1_embed_dim → prompt_ctx_dim) + LayerNorm.
+# prompt_ctx_dim MUST match the chosen SD backbone's cross_attention_dim:
+#   SD 1.5          → 768   (CLIP ViT-L/14)
+#   SD 2.0 / 2.1    → 1024  (OpenCLIP-ViT-H)
+prompt_ctx_dim: 768
+
+# ---------------------------------------------------------------- Discriminator
+disc_base_ch: 64
+disc_t_embed_dim: 256
+disc_t_mlp_dim: 512
+
+# ---------------------------------------------------------------- Optimization
+total_iters: 150000
+batch_size: 2
+grad_accum_steps: 1
+lr_g: 1.0e-4
+lr_d: 4.0e-5                   # TTUR 2.5:1 vs G — curbs D dominance
+betas_g: [0.9, 0.999]
+betas_d: [0.5, 0.999]
+weight_decay: 0.01
+grad_clip_norm: 1.0
+
+lr_schedule: cosine
+warmup_iters: 1000
+min_lr_ratio: 0.1
+
+# Extended warmup: reconstruction anchors G before adversarial term ramps up.
+gan_warmup_iters: 20000
+
+d_update_every: 1
+
+# Restrict adversarial t to U{1, t_max_dis-1} to avoid near-pure-noise samples.
+t_max_dis: 500
+
+# R1 gradient penalty on D (γ=0 disables). γ=10 is the ADM/StyleGAN default.
+r1_gamma: 10.0
+r1_every: 16
+
+# ---------------------------------------------------------------- Loss weights
+# OSDFace Eq. 12 (+ standard 0.1 ID weight). No region-L1.
+lambda_mse: 1.0
+lambda_per: 1.0                # EA-DISTS = DISTS + Sobel(DISTS)
+lambda_id:  0.1                # ArcFace identity loss
+lambda_dis: 0.3                # adversarial
+enable_id:  true
+
+# Region-L1 MUST stay 0 for the OSDFace baseline (no parser).
+lambda_region_l1: 0.0
+
+# ---------------------------------------------------------------- Memory
+amp: true
+amp_dtype: bfloat16
+grad_ckpt: true
+vae_slicing: true
+vae_tiling: false
+
+# ---------------------------------------------------------------- Checkpointing / logs
+# Dedicated dirs so CRAFT and OSDFace baselines don't clobber each other.
+ckpt_dir:  /projectnb/cs585/projects/craft/checkpoints_stage2_osdface
+sample_dir: /projectnb/cs585/projects/craft/samples_stage2_osdface
+resume:    ""
+save_every: 5000
+sample_every: 2000
+log_every: 50
+num_sample_images: 8
+
+# ---------------------------------------------------------------- Misc
+seed: 1234
+device: cuda

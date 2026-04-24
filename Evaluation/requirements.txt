@@ -1,0 +1,19 @@
+# Evaluation dependencies for CRAFT & OSDFace face restoration
+# Installed on top of the existing CRAFT training environment.
+
+# IQA metrics (LPIPS, DISTS, MUSIQ, NIQE, CLIPIQA, MANIQA, FID)
+pyiqa>=0.1.10
+
+# ArcFace identity embedding + face detection/alignment (for Deg.)
+facexlib>=0.3.0
+
+# Face landmarks for LMD (68-point FAN detector)
+face-alignment>=1.4.1
+
+# Classical metrics
+scikit-image>=0.21.0
+
+# Misc
+tqdm
+pyyaml
+pandas

@@ -1,0 +1,37 @@
+# CelebA-Test evaluation config — full OSDFace paper Table 1 metrics.
+# Paired HQ/LQ data; both stage-1 (VQVAE) and stage-2 (diffusion) are scored.
+
+dataset: celeba
+
+# ── Inputs ────────────────────────────────────────────────────────────────
+lq_dir:   /projectnb/cs585/projects/craft/data/test/CelebA/Self_CelebA_Validation_v2/self_celeba_512_v2
+hq_dir:   /projectnb/cs585/projects/craft/data/test/CelebA/CelebA_Validation/celeba_512_validation
+ffhq_dir: /projectnb/cs585/projects/craft/data/train/images512x512
+
+# ── Shared ────────────────────────────────────────────────────────────────
+parser_ckpt:  /projectnb/cs585/projects/craft/pretrained/79999_iter.pth
+results_root: /projectnb/cs585/projects/craft/Evaluation_Results
+
+# ── CRAFT ─────────────────────────────────────────────────────────────────
+craft:
+  stage1_ckpt: /projectnb/cs585/projects/craft/checkpoints/phase_d/final.pt
+  stage2_ckpt: /projectnb/cs585/projects/craft/checkpoints_stage2/final.pt
+  embed_dim:   512
+  rq_levels:   3
+  hq_n_codes:  1024
+
+# ── OSDFace ───────────────────────────────────────────────────────────────
+osdface:
+  stage1_ckpt: /projectnb/cs585/projects/craft/checkpoints_osdface/phase_c/final.pt
+  stage2_ckpt: /projectnb/cs585/projects/craft/checkpoints_stage2_osdface/final.pt
+  embed_dim:   512
+  lq_n_codes:  1024
+
+# ── Stage-2 common (SD 2.1 + LoRA) ────────────────────────────────────────
+stage2:
+  pretrained_model: stabilityai/stable-diffusion-2-1-base
+  mixed_precision:  fp16
+  merge_lora:       true
+  lora_rank:        16
+  lora_alpha:       16
+  prompts_json:     ""   # empty → run without text prompts

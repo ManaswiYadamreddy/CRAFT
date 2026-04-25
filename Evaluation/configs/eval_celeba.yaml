@@ -28,8 +28,10 @@ osdface:
   lq_n_codes:  1024
 
 # ── Stage-2 common (SD 2.1 + LoRA) ────────────────────────────────────────
+# Official HF `stabilityai/stable-diffusion-2-1-base` is no longer downloadable;
+# point this at the local copy fetched from ModelScope (see Evaluation README).
 stage2:
-  pretrained_model: stabilityai/stable-diffusion-2-1-base
+  pretrained_model: /projectnb/cs585/projects/craft/pretrained/stable-diffusion-2-1-base
   mixed_precision:  fp16
   merge_lora:       true
   lora_rank:        16

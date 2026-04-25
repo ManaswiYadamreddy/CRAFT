@@ -6,31 +6,12 @@ Supports both stages:
     --stage 1   CRAFT Stage-1 VQVAE (region-aware, checkpoints/phase_d/final.pt)
                 Direct LQ → HQ reconstruction through the learned codebook.
 
-    --stage 2   CRAFT Stage-2 diffusion (SD 2.1 + LoRA + Stage-1 VRE)
-                Delegates to infer_concat.py with CRAFT's Stage-1 encoder as the
-                visual representation embedder. The Stage-2 checkpoint directory
-                must contain `pytorch_lora_weights.safetensors` and
-                `embedding_change_weights.pth`. If --stage2_ckpt points to a
-                file (e.g. final.pt), we use its parent directory.
-
-Usage:
-    # Stage 1
-    python -m Evaluation.inference.infer_craft \
-        --stage 1 \
-        --stage1_ckpt /projectnb/.../checkpoints/phase_d/final.pt \
-        --parser_ckpt /projectnb/.../pretrained/79999_iter.pth \
-        --input_dir   /projectnb/.../LQ \
-        --output_dir  /projectnb/.../results/craft_s1
-
-    # Stage 2
-    python -m Evaluation.inference.infer_craft \
-        --stage 2 \
-        --stage1_ckpt /projectnb/.../checkpoints/phase_d/final.pt \
-        --stage2_ckpt /projectnb/.../checkpoints_stage2/final.pt \
-        --parser_ckpt /projectnb/.../pretrained/79999_iter.pth \
-        --input_dir   /projectnb/.../LQ \
-        --output_dir  /projectnb/.../results/craft_s2 \
-        --merge_lora --mixed_precision fp16
+    --stage 2   CRAFT Stage-2 one-step diffusion (SD 1.5 + LoRA + Stage-1 VRE).
+                Loads `final.pt` produced by train_stage2.py — a dict with keys
+                {iter, generator, discriminator, optim_g, optim_d, args}. We
+                rebuild Stage2Generator with matching hyperparams and load the
+                `generator` state dict (LoRA + prompt_proj + prompt_ln) on top
+                of the frozen SD 1.5 backbone + Stage-1 VRE.
 """
 from __future__ import annotations
 
@@ -127,67 +108,74 @@ def _run_stage1(args, device: torch.device):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Stage 2 — SD 2.1 + LoRA + Stage-1 VRE (delegates to infer_concat.py)
+# Stage 2 — SD 1.5 + LoRA + Stage-1 VRE (one-step diffusion)
 # ══════════════════════════════════════════════════════════════════════════
 
-def _normalize_stage2_ckpt_dir(p: str) -> str:
-    """
-    infer_concat.py expects `ckpt_path` to be a DIRECTORY containing
-    pytorch_lora_weights.safetensors + embedding_change_weights.pth.
-    If the user passes `/…/final.pt` (file), we fall back to its parent dir.
-    """
-    if os.path.isdir(p):
-        return p
-    if os.path.isfile(p) or p.endswith(".pt"):
-        return os.path.dirname(p)
-    return p
-
-
+@torch.no_grad()
 def _run_stage2(args, device: torch.device):
-    # Lazy import to avoid pulling diffusers/peft when running stage 1
-    import random
-    import numpy as np
-    import torch.multiprocessing as mp
-    from infer_concat import merge_unet, run_inference
+    from models.stage2_generator import Stage2Generator
 
-    ckpt_dir = _normalize_stage2_ckpt_dir(args.stage2_ckpt)
-    if ckpt_dir != args.stage2_ckpt:
-        print(f"  [stage2] Using ckpt directory: {ckpt_dir}")
-    if not os.path.isdir(ckpt_dir):
-        raise FileNotFoundError(f"Stage-2 checkpoint dir not found: {ckpt_dir}")
+    if not os.path.isfile(args.stage2_ckpt):
+        raise FileNotFoundError(f"Stage-2 checkpoint not found: {args.stage2_ckpt}")
 
-    # Build an argparse.Namespace compatible with infer_concat.run_inference
-    s2_args = argparse.Namespace(
-        input_image     = args.input_dir,
-        output_dir      = args.output_dir,
-        ckpt_path       = ckpt_dir,
-        img_encoder_weight = args.stage1_ckpt,   # CRAFT's Stage-1 acts as VRE
-        prompts_json    = args.prompts_json or None,
-        pretrained_model_name_or_path = args.pretrained_model,
-        mixed_precision = args.mixed_precision,
-        gpu_ids         = args.gpu_ids,
-        merge_lora      = args.merge_lora,
-        lora_rank       = args.lora_rank,
-        lora_alpha      = args.lora_alpha,
-        seed            = args.seed,
-        cat_prompt_embedding = False,
-        use_pos_embedding    = False,
-        use_att_pool         = False,
-        learnable_pos_emb    = False,
+    print("Loading CRAFT Stage-2 generator...")
+    gen = Stage2Generator(
+        stage1_ckpt_path=args.stage1_ckpt,
+        parser_ckpt=args.parser_ckpt,
+        sd_model_name=args.pretrained_model,
+        t_fixed=args.t_fixed,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        prompt_dim=args.embed_dim,
+        context_dim=args.context_dim,
     )
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError:
-        pass
+    print(f"  {gen.describe()}")
 
+    ckpt = torch.load(args.stage2_ckpt, map_location="cpu", weights_only=False)
+    gen_state = ckpt["generator"] if isinstance(ckpt, dict) and "generator" in ckpt else ckpt
+    missing, unexpected = gen.load_state_dict(gen_state, strict=False)
+    # Frozen modules (stage1.*, vae.*, base unet) aren't in the ckpt — those
+    # land in `missing` and are expected. `unexpected` keys would indicate a
+    # real mismatch.
+    trainable_missing = [k for k in missing if "lora" in k.lower() or k.startswith(("prompt_proj", "prompt_ln"))]
+    if trainable_missing:
+        raise RuntimeError(
+            f"Stage-2 ckpt is missing {len(trainable_missing)} trainable keys, "
+            f"e.g. {trainable_missing[:3]}"
+        )
+    if unexpected:
+        print(f"  [stage2] WARNING: {len(unexpected)} unexpected keys (first 3): {unexpected[:3]}")
+    print(f"  loaded {len(gen_state)} tensors from {args.stage2_ckpt} (iter={ckpt.get('iter', '?')})")
+
+    weight_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.float32
+    gen.to(device=device, dtype=weight_dtype)
+    gen.eval()
+
+    paths = _list_images(args.input_dir)
+    if not paths:
+        raise FileNotFoundError(f"No images found under {args.input_dir}")
     os.makedirs(args.output_dir, exist_ok=True)
-    unet_merged = merge_unet(s2_args) if args.merge_lora else None
-    run_inference(s2_args, unet_merged)
+    print(f"Found {len(paths)} images in {args.input_dir}")
+
+    to_tensor = transforms.ToTensor()
+    to_pil    = transforms.ToPILImage()
+
+    for path in tqdm(paths, desc="CRAFT-S2"):
+        name = os.path.splitext(os.path.basename(path))[0]
+        out_path = os.path.join(args.output_dir, f"{name}.png")
+        if os.path.exists(out_path) and not args.overwrite:
+            continue
+
+        img = Image.open(path).convert("RGB")
+        x01 = to_tensor(img).unsqueeze(0).to(device, dtype=weight_dtype)
+        if x01.shape[-2:] != (args.resolution, args.resolution):
+            x01 = F.interpolate(x01, size=(args.resolution, args.resolution),
+                                mode="bilinear", align_corners=False)
+        x11 = x01 * 2.0 - 1.0
+
+        I_hat, *_ = gen(x11, x01)
+        I_hat01 = ((I_hat.clamp(-1, 1) + 1) / 2).float()
+        to_pil(I_hat01[0].cpu()).save(out_path)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -211,17 +199,27 @@ def main():
     ap.add_argument("--rq_levels",   type=int, default=3)
     ap.add_argument("--resolution",  type=int, default=512)
 
-    # Stage-2 checkpoints + SD settings
+    # Stage-2 checkpoint + SD settings
     ap.add_argument("--stage2_ckpt", default="",
-                    help="CRAFT Stage-2 LoRA checkpoint dir (or any file inside it)")
-    ap.add_argument("--pretrained_model", default="stabilityai/stable-diffusion-2-1-base")
+                    help="Path to train_stage2.py final.pt (the bundle dict)")
+    ap.add_argument("--pretrained_model",
+                    default="sd-legacy/stable-diffusion-v1-5",
+                    help="Local SD 1.5 directory (or HF id if reachable)")
     ap.add_argument("--mixed_precision", choices=["fp16", "fp32"], default="fp16")
-    ap.add_argument("--merge_lora", action="store_true")
     ap.add_argument("--lora_rank",  type=int,   default=16)
     ap.add_argument("--lora_alpha", type=float, default=16)
-    ap.add_argument("--prompts_json", default=None)
-    ap.add_argument("--gpu_ids", nargs="+", type=int, default=[0])
+    ap.add_argument("--t_fixed",    type=int,   default=999,
+                    help="One-step DDIM timestep (matches training t_low)")
+    ap.add_argument("--context_dim", type=int,  default=768,
+                    help="UNet cross-attention dim (768 for SD 1.5, 1024 for SD 2.x)")
     ap.add_argument("--seed",  type=int, default=42)
+    # Accepted-but-ignored (kept for run_eval.sh backward compat)
+    ap.add_argument("--merge_lora", action="store_true",
+                    help="(no-op) — LoRA stays attached via PEFT for stage 2")
+    ap.add_argument("--prompts_json", default=None,
+                    help="(no-op) — stage 2 generator does not use text prompts")
+    ap.add_argument("--gpu_ids", nargs="+", type=int, default=[0],
+                    help="(no-op) — single-GPU inference; first id is used")
 
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--overwrite", action="store_true")

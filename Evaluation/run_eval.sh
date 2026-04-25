@@ -88,6 +88,8 @@ run_one () {
   local SD_PROMPTS  ; SD_PROMPTS=$(read_cfg   "$CFG" stage2.prompts_json)
   local SD_RANK     ; SD_RANK=$(read_cfg      "$CFG" stage2.lora_rank)
   local SD_ALPHA    ; SD_ALPHA=$(read_cfg     "$CFG" stage2.lora_alpha)
+  local SD_TFIXED   ; SD_TFIXED=$(read_cfg    "$CFG" stage2.t_fixed)
+  local SD_CTXDIM   ; SD_CTXDIM=$(read_cfg    "$CFG" stage2.context_dim)
 
   local MERGE_FLAG=""
   if [[ "$SD_MERGE" == "True" || "$SD_MERGE" == "true" ]]; then
@@ -139,6 +141,9 @@ run_one () {
     fi
 
     if has_stage stage2; then
+      local TFIXED_FLAG=""  ; [[ -n "$SD_TFIXED" ]] && TFIXED_FLAG="--t_fixed $SD_TFIXED"
+      local CTXDIM_FLAG=""  ; [[ -n "$SD_CTXDIM" ]] && CTXDIM_FLAG="--context_dim $SD_CTXDIM"
+
       echo ""
       echo "[inference] CRAFT Stage-2 → $DIR_CS2"
       # shellcheck disable=SC2086
@@ -149,10 +154,11 @@ run_one () {
         --parser_ckpt "$PARSER_CKPT" \
         --input_dir   "$LQ_DIR" \
         --output_dir  "$DIR_CS2" \
+        --embed_dim   "$CRAFT_EMBED" \
         --pretrained_model "$SD_MODEL" \
         --mixed_precision  "$SD_PREC" \
         --lora_rank  "$SD_RANK" --lora_alpha "$SD_ALPHA" \
-        $MERGE_FLAG $PROMPTS_FLAG
+        $TFIXED_FLAG $CTXDIM_FLAG $MERGE_FLAG $PROMPTS_FLAG
 
       echo ""
       echo "[inference] OSDFace Stage-2 → $DIR_OS2"
@@ -163,10 +169,12 @@ run_one () {
         --stage2_ckpt "$OSD_S2" \
         --input_dir   "$LQ_DIR" \
         --output_dir  "$DIR_OS2" \
+        --embed_dim   "$OSD_EMBED" \
+        --lq_n_codes  "$OSD_NCODE" \
         --pretrained_model "$SD_MODEL" \
         --mixed_precision  "$SD_PREC" \
         --lora_rank  "$SD_RANK" --lora_alpha "$SD_ALPHA" \
-        $MERGE_FLAG $PROMPTS_FLAG
+        $TFIXED_FLAG $CTXDIM_FLAG $MERGE_FLAG $PROMPTS_FLAG
     fi
   fi
 

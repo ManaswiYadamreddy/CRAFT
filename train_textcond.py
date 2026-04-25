@@ -26,16 +26,17 @@ prompts.json format:
 
 Usage:
     python train_textcond.py \
-        --lq_dir data/train/lq \
-        --hq_dir data/train/hq \
-        --prompts_json data/train/prompts.json \
-        --pretrained_model_name_or_path pretrained/sd21 \
-        --img_encoder_weight pretrained/associate_2.ckpt \
-        --ckpt_path pretrained \
-        --output_dir checkpoints/textcond_v3 \
-        --mixed_precision bf16 \
-        --batch_size 4 \
-        --max_train_steps 50000
+    --lq_dir /projectnb/cs585/projects/craft/data/train/LQ_images_512x512 \
+    --hq_dir /projectnb/cs585/projects/craft/data/train/images512x512 \
+    --prompts_json /projectnb/cs585/projects/craft/prompts_output_final.json \
+    --pretrained_model_name_or_path /projectnb/cs585/projects/craft/osdface/pretrained/sd21 \
+    --img_encoder_weight /projectnb/cs585/projects/craft/osdface/pretrained/associate_2.ckpt \
+    --ckpt_path /projectnb/cs585/projects/craft/osdface/pretrained \
+    --output_dir checkpoints/textcond_v5 \
+    --mixed_precision bf16 \
+    --batch_size 4 \
+    --max_train_steps 50000 \
+    --text_embed_mode eos
 """
 
 import os
@@ -347,11 +348,121 @@ def encode_text(prompts, tokenizer, text_encoder, device, weight_dtype):
     return eos_embeds.to(weight_dtype)
 
 
+@torch.no_grad()
+def encode_text_mean_pooled(prompts, tokenizer, text_encoder, device, weight_dtype):
+    """
+    Encode prompts as mean-pooled CLIP hidden states, then broadcast to sequence.
+    This preserves information from all tokens and can strengthen attribute signal.
+    """
+    input_ids = tokenizer(
+        prompts,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    ).input_ids.to(device)
+
+    hidden = text_encoder(input_ids).last_hidden_state  # (B, 77, 1024)
+    pooled = hidden.mean(dim=1)  # (B, 1024)
+    pooled = pooled.unsqueeze(1).expand(-1, tokenizer.model_max_length, -1)
+    return pooled.to(weight_dtype)
+
+
+def encode_text_dispatch(prompts, tokenizer, text_encoder, device, weight_dtype, mode):
+    if mode == "eos":
+        return encode_text(prompts, tokenizer, text_encoder, device, weight_dtype)
+    if mode == "mean_pool":
+        return encode_text_mean_pooled(prompts, tokenizer, text_encoder, device, weight_dtype)
+    raise ValueError(f"Unsupported --text_embed_mode: {mode}")
+
+
 def save_checkpoint(conditioner, output_dir, step):
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(ckpt_dir, exist_ok=True)
     conditioner.save(os.path.join(ckpt_dir, "text_conditioner.pth"))
+    training_state = {"global_step": step}
+    torch.save(training_state, os.path.join(ckpt_dir, "training_state.pt"))
     logger.info(f"Checkpoint saved → {ckpt_dir}")
+
+
+def save_training_state(optimizer, lr_scheduler, scaler, output_dir, step):
+    ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    training_state = {
+        "global_step": step,
+        "optimizer": optimizer.state_dict(),
+        "lr_scheduler": lr_scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+    }
+    torch.save(training_state, os.path.join(ckpt_dir, "training_state.pt"))
+    logger.info(f"Training state saved → {ckpt_dir}")
+
+
+def get_latest_checkpoint(output_dir):
+    pattern = os.path.join(output_dir, "checkpoint-*")
+    candidates = []
+    for path in glob.glob(pattern):
+        name = os.path.basename(path)
+        if not name.startswith("checkpoint-"):
+            continue
+        try:
+            step = int(name.split("-")[-1])
+        except ValueError:
+            continue
+        candidates.append((step, path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
+
+
+def resolve_resume_checkpoint(args):
+    if args.resume_from_checkpoint is None:
+        return None
+    if args.resume_from_checkpoint.lower() == "latest":
+        latest = get_latest_checkpoint(args.output_dir)
+        if latest is None:
+            raise ValueError(
+                f"--resume_from_checkpoint=latest but no checkpoints were found in {args.output_dir}"
+            )
+        return latest
+    return args.resume_from_checkpoint
+
+
+def load_checkpoint_if_available(args, conditioner, optimizer, lr_scheduler, scaler, device):
+    resume_path = resolve_resume_checkpoint(args)
+    if resume_path is None:
+        return 0
+
+    if not os.path.isdir(resume_path):
+        raise ValueError(f"Resume checkpoint directory does not exist: {resume_path}")
+
+    conditioner_path = os.path.join(resume_path, "text_conditioner.pth")
+    if not os.path.isfile(conditioner_path):
+        raise ValueError(f"Missing conditioner checkpoint: {conditioner_path}")
+    conditioner.load(conditioner_path, map_location=device)
+
+    state_path = os.path.join(resume_path, "training_state.pt")
+    global_step = 0
+    if os.path.isfile(state_path):
+        state = torch.load(state_path, map_location=device, weights_only=False)
+        global_step = int(state.get("global_step", 0))
+        if "optimizer" in state:
+            optimizer.load_state_dict(state["optimizer"])
+        if "lr_scheduler" in state:
+            lr_scheduler.load_state_dict(state["lr_scheduler"])
+        if "scaler" in state:
+            scaler.load_state_dict(state["scaler"])
+    else:
+        ckpt_name = os.path.basename(os.path.normpath(resume_path))
+        if ckpt_name.startswith("checkpoint-"):
+            try:
+                global_step = int(ckpt_name.split("-")[-1])
+            except ValueError:
+                global_step = 0
+
+    logger.info(f"Resumed training from {resume_path} at global step {global_step}")
+    return global_step
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +533,7 @@ def build_models(args, device):
 @torch.no_grad()
 def eval_step(unet, vae, img_encoder, embedding_change, conditioner,
               tokenizer, text_encoder, noise_scheduler,
-              dataloader, device, weight_dtype, step, film_neg_weight):
+              dataloader, device, weight_dtype, step, film_neg_weight, text_embed_mode):
     conditioner.eval()
     alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
     timestep = 399
@@ -437,8 +548,12 @@ def eval_step(unet, vae, img_encoder, embedding_change, conditioner,
         visual_embeds = embedding_change(
             img_encoder(lq).reshape(lq.shape[0], 77, -1)
         )
-        pos_embeds = encode_text(pos, tokenizer, text_encoder, device, weight_dtype)
-        na_embeds  = encode_text(na,  tokenizer, text_encoder, device, weight_dtype)
+        pos_embeds = encode_text_dispatch(
+            pos, tokenizer, text_encoder, device, weight_dtype, text_embed_mode
+        )
+        na_embeds  = encode_text_dispatch(
+            na, tokenizer, text_encoder, device, weight_dtype, text_embed_mode
+        )
 
         hq_latent = vae.encode(hq).latent_dist.sample() * vae.config.scaling_factor
         lq_latent = vae.encode(lq).latent_dist.sample() * vae.config.scaling_factor
@@ -515,13 +630,15 @@ def train(args):
     vae.eval()
     conditioner.train()
 
-    global_step = 0
+    global_step = load_checkpoint_if_available(
+        args, conditioner, optimizer, lr_scheduler, scaler, device
+    )
     data_iter   = iter(train_loader)
 
     logger.info(f"Starting training for {args.max_train_steps} steps...")
     logger.info(f"Loss weights — latent: 1.0 | pixel: {args.pixel_loss_weight} | "
                 f"grad: {args.grad_loss_weight} | contrastive: {args.contrastive_loss_weight}")
-    pbar = tqdm(total=args.max_train_steps, desc="Training")
+    pbar = tqdm(total=args.max_train_steps, initial=global_step, desc="Training")
 
     while global_step < args.max_train_steps:
         try:
@@ -544,11 +661,11 @@ def train(args):
                     img_encoder(lq).reshape(lq.shape[0], 77, -1)
                 )  # (B, 77, 1024)
 
-                pos_embeds = encode_text(
-                    pos, tokenizer, text_encoder, device, weight_dtype
+                pos_embeds = encode_text_dispatch(
+                    pos, tokenizer, text_encoder, device, weight_dtype, args.text_embed_mode
                 )  # (B, 77, 1024)
-                na_embeds = encode_text(
-                    na, tokenizer, text_encoder, device, weight_dtype
+                na_embeds = encode_text_dispatch(
+                    na, tokenizer, text_encoder, device, weight_dtype, args.text_embed_mode
                 )  # (B, 77, 1024)
 
                 hq_latent = (
@@ -582,10 +699,11 @@ def train(args):
             loss_latent = F.l1_loss(x0_pred, hq_latent)
 
             if args.pixel_loss_weight > 0 or args.grad_loss_weight > 0:
-                with torch.no_grad():
-                    x0_decoded = vae.decode(
-                        x0_pred / vae.config.scaling_factor
-                    ).sample.clamp(-1, 1)
+                # Keep gradient path: pixel/gradient losses -> x0_pred -> FiLM params.
+                # VAE stays frozen since requires_grad_(False) is set during model build.
+                x0_decoded = vae.decode(
+                    x0_pred / vae.config.scaling_factor
+                ).sample.clamp(-1, 1)
 
                 loss_pixel = F.l1_loss(x0_decoded, hq) if args.pixel_loss_weight > 0 \
                              else torch.tensor(0.0, device=device)
@@ -635,14 +753,16 @@ def train(args):
                 unet, vae, img_encoder, embedding_change, conditioner,
                 tokenizer, text_encoder, noise_scheduler,
                 eval_loader, device, weight_dtype, global_step,
-                args.film_neg_weight,
+                args.film_neg_weight, args.text_embed_mode,
             )
 
         if global_step % args.save_every == 0:
             save_checkpoint(conditioner, args.output_dir, global_step)
+            save_training_state(optimizer, lr_scheduler, scaler, args.output_dir, global_step)
 
     pbar.close()
     save_checkpoint(conditioner, args.output_dir, global_step)
+    save_training_state(optimizer, lr_scheduler, scaler, args.output_dir, global_step)
     logger.info("Training complete.")
 
 
@@ -664,6 +784,8 @@ def parse_args():
     p.add_argument("--img_encoder_weight", default="pretrained/associate_2.ckpt")
     p.add_argument("--ckpt_path",    required=True)
     p.add_argument("--output_dir",   default="checkpoints/textcond_v3")
+    p.add_argument("--resume_from_checkpoint", type=str, default=None,
+                   help="Path to checkpoint directory to resume from, or 'latest'.")
 
     # Pretrained OSDFace LoRA (for merging only)
     p.add_argument("--pretrained_lora_rank",  type=int,   default=16)
@@ -690,6 +812,9 @@ def parse_args():
     # FiLM
     p.add_argument("--film_neg_weight", type=float, default=0.5,
                    help="Weight for na suppression in FiLM modulation (default: 0.5)")
+    p.add_argument("--text_embed_mode", type=str, default="mean_pool",
+                   choices=["eos", "mean_pool"],
+                   help="Text embedding mode for FiLM conditioning.")
 
     # VRE passthrough
     p.add_argument("--cat_prompt_embedding", action="store_true")

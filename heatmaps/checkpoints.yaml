@@ -1,0 +1,44 @@
+# =============================================================================
+# checkpoints.yaml — config for heatmap generation
+#
+# Edit the `runs` section to point at the training runs you want to analyze.
+# Each run lists which checkpoint steps to generate heatmaps for.
+#
+# Used by:
+#   python heatmaps/generate_heatmaps.py --config heatmaps/checkpoints.yaml
+# =============================================================================
+
+# Shared settings — applied to every run unless overridden
+defaults:
+  pretrained_model_name_or_path: /projectnb/cs585/projects/craft/osdface/pretrained/sd21
+  prompts_json:                  /projectnb/cs585/projects/craft/prompts_output_final.json
+
+  # Which prompt entries to use as probes. Each one produces its own heatmap.
+  # Use "image" field values from prompts.json — e.g. "00020.png".
+  probe_images:
+    - 00020.png
+
+  # neg_weight values to sweep for each probe.
+  neg_weights: [0.0, 0.5, 1.0]
+
+  # Output root — each run/checkpoint gets a subfolder here
+  output_dir: heatmaps/out
+
+# =============================================================================
+# Runs to analyze — add or remove entries as needed
+# =============================================================================
+runs:
+  - name: textcond_v5
+    checkpoint_dir: "/usr4/cs640/nehanik/Desktop/CS585/checkpoints"
+    steps:
+      - 1
+      - 5000
+      - 10000
+      - 15000
+      - 20000
+      - 25000
+      - 30000
+      - 35000
+      - 40000
+      - 45000
+      - 50000

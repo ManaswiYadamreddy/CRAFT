@@ -1,0 +1,18 @@
+{
+  "checkpoint": "/usr4/cs640/nehanik/Desktop/CS585/checkpoints/checkpoint-15000/text_conditioner.pth",
+  "label": "textcond_v5 @ step 15000",
+  "n_blocks": 16,
+  "neg_weights": [
+    0.0,
+    0.5,
+    1.0
+  ],
+  "probes": {
+    "00020.png": {
+      "png": "heatmap__00020.png",
+      "csv": "heatmap__00020.csv",
+      "gamma_norm_max": 19.21023941040039,
+      "beta_norm_max": 33.087730407714844
+    }
+  }
+}

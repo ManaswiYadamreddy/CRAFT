@@ -37,9 +37,10 @@ class LandmarkDistance:
         lms = self.fa.get_landmarks_from_image(img_uint8_hwc)
         if lms is None or len(lms) == 0:
             return None
-        # Take the largest face if multiple are detected
+        # Take the largest face if multiple are detected.
+        # NumPy 2.0 removed `arr.ptp()`; use the free function np.ptp(arr).
         if len(lms) > 1:
-            areas = [(lm[:, 0].ptp() * lm[:, 1].ptp()) for lm in lms]
+            areas = [(np.ptp(lm[:, 0]) * np.ptp(lm[:, 1])) for lm in lms]
             lms = [lms[int(np.argmax(areas))]]
         return lms[0].astype(np.float32)
 

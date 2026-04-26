@@ -36,6 +36,25 @@ class IdentityDistance:
         # Downloads arcface_resnet18.pth on first call into ~/.cache.
         self.net = init_recognition_model("arcface", device=self.device)
         self.net.eval()
+        self._patch_flatten_view(self.net)
+
+    @staticmethod
+    def _patch_flatten_view(net: torch.nn.Module) -> None:
+        """
+        facexlib's `Flatten` (in arcface_arch.py) calls
+        `input.view(input.size(0), -1)`, which raises on non-contiguous tensors
+        produced by some convolution kernels in newer PyTorch (e.g. 2.x). Swap
+        in `.reshape(...)` which is non-contiguous-safe (copies if needed).
+        """
+        import types
+
+        def _safe_flatten_forward(self, input):
+            return input.reshape(input.size(0), -1)
+
+        for m in net.modules():
+            cls = m.__class__
+            if cls.__name__ == "Flatten" and cls.__module__.endswith("arcface_arch"):
+                m.forward = types.MethodType(_safe_flatten_forward, m)
 
     @torch.no_grad()
     def _embed(self, imgs_01: torch.Tensor) -> torch.Tensor:

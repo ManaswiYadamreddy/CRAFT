@@ -21,11 +21,13 @@ the reconstruction should change after a swap.
 
 ## Files
 
-- `code_swap.py` — single-image version.
-- `code_swap_batch.py` — batch version over a folder of LQ images, with
-  optional matching HQ folder pulled into the panel.
+- `code_swap.py` — single-image, Stage-1 reconstruction.
+- `code_swap_batch.py` — batch over a folder of LQ images, Stage-1 reconstruction.
+- `code_swap_batch_stage2.py` — batch with the **Stage-2 diffusion generator**
+  doing the reconstruction (LQ encoder + region-aware VQ + swap → SD-1.5/2.x
+  one-step diffusion → I_hat). Uses your trained Stage-2 LoRA + projector.
 
-Both are self-contained — pick whichever you need.
+All three are self-contained — pick whichever matches what you want to show.
 
 ## How to read the output
 
@@ -86,6 +88,41 @@ python code_swap/code_swap_batch.py \
 
 `--hq_dir` is optional — drop it if you only have LQ. The panel just
 collapses to `LQ | baseline | donor_1 | …` when HQ isn't found.
+
+## Batch with the Stage-2 diffusion generator
+
+Same swap logic, but each cell of the panel is now a one-step SD
+reconstruction conditioned on the (possibly-swapped) visual prompt — i.e.
+"what does the diffusion model paint when the codebook routes are nudged?"
+
+```bash
+python code_swap/code_swap_batch_stage2.py \
+    --stage1_ckpt   /projectnb/cs585/projects/craft/checkpoints/phase_d/final.pt \
+    --stage2_ckpt   /projectnb/cs585/projects/craft/checkpoints_stage2/final.pt \
+    --parser_ckpt   /projectnb/cs585/projects/craft/pretrained/79999_iter.pth \
+    --input_dir     /projectnb/cs585/projects/craft/data/test/CelebA/Self_CelebA_Validation_v2/self_celeba_512_v2/ \
+    --hq_dir        /projectnb/cs585/projects/craft/data/test/CelebA/CelebA_Validation/celeba_512_validation/ \
+    --out_dir       /projectnb/cs585/projects/craft/code_swap_outputs/celeba_lq_stage2 \
+    --regions       eyes lips hair \
+    --level         0 \
+    --n_donors      4 \
+    --max_images    20 \
+    --use_hq_for_parser \
+    --skip_existing
+```
+
+If your Stage-2 training used SD 2.1 instead of SD 1.5, override the SD
+defaults to match:
+
+```bash
+    --pretrained_model stabilityai/stable-diffusion-2-1-base \
+    --context_dim      1024 \
+```
+
+The Stage-2 swap pipeline is the *interesting* one: it asks "does swapping
+a code id at position p change what the diffusion model paints in region p,
+or does the LoRA-tuned UNet wash the swap out?" Both possible outcomes are
+informative.
 
 ## Knobs
 

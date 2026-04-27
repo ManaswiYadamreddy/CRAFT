@@ -133,15 +133,20 @@ class TextConditioner(nn.Module):
                 rest = None
 
             device, dtype = h.device, h.dtype
+            film_dtype = next(self.film_pos_layers[key].parameters()).dtype
 
             # Positive guidance — dedicated pos MLP
-            pos_pooled = self._pos_emb.mean(dim=1).to(device, dtype=dtype)
+            pos_pooled = self._pos_emb.mean(dim=1).to(device, dtype=film_dtype)
             gamma_pos, beta_pos = self.film_pos_layers[key](pos_pooled)
+            gamma_pos = gamma_pos.to(dtype=dtype)
+            beta_pos = beta_pos.to(dtype=dtype)
 
             if self._na_emb is not None and self._neg_weight > 0:
                 # Negative suppression — dedicated na MLP (learns independently)
-                na_pooled = self._na_emb.mean(dim=1).to(device, dtype=dtype)
+                na_pooled = self._na_emb.mean(dim=1).to(device, dtype=film_dtype)
                 gamma_na, beta_na = self.film_na_layers[key](na_pooled)
+                gamma_na = gamma_na.to(dtype=dtype)
+                beta_na = beta_na.to(dtype=dtype)
 
                 gamma_net = gamma_pos - self._neg_weight * gamma_na
                 beta_net  = beta_pos  - self._neg_weight * beta_na

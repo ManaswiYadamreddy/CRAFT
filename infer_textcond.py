@@ -5,15 +5,28 @@ Loads the frozen OSDFace pipeline and attaches a trained TextConditioner
 to guide restoration using per-image pos + na text prompts.
 
 Usage:
+    Train
     python infer_textcond.py \
-        --input_image /projectnb/cs585/projects/craft/data/train/LQ_images_512x512/66123_LQ.png \
-        --output_dir results/textcondv4_test \
+        --input_image /projectnb/cs585/projects/craft/data/train/LQ_images_512x512/00020_LQ.png \
+        --output_dir results/textcondfinal_test \
         --prompts_json /projectnb/cs585/projects/craft/prompts_output_final.json \
-        --pretrained_model_name_or_path pretrained/sd21\
-        --img_encoder_weight pretrained/associate_2.ckpt \
-        --ckpt_path pretrained \
-        --conditioner_path checkpoints/textcond_v4/checkpoint-10000/text_conditioner.pth \
+        --pretrained_model_name_or_path /projectnb/cs585/projects/craft/osdface/pretrained/sd21\
+        --img_encoder_weight /projectnb/cs585/projects/craft/osdface/pretrained/associate_2.ckpt \
+        --ckpt_path /projectnb/cs585/projects/craft/osdface/pretrained \
+        --conditioner_path checkpoints/textcond_final/checkpoint-50000/text_conditioner.pth \
         --film_neg_weight 0.5 \
+        --gpu_ids 0 \
+        --mixed_precision fp16
+    Test
+    python infer_textcond.py \
+        --input_image /projectnb/cs585/projects/craft/data/test/CelebA/Self_CelebA_Validation_v2/self_celeba_512_v2/00000037.png \
+        --output_dir results/textcondfinal_test/ \
+        --prompts_json /projectnb/cs585/projects/craft/data/test/CelebA/celeba_prompts_output.json \
+        --pretrained_model_name_or_path /projectnb/cs585/projects/craft/osdface/pretrained/sd21\
+        --img_encoder_weight /projectnb/cs585/projects/craft/osdface/pretrained/associate_2.ckpt \
+        --ckpt_path /projectnb/cs585/projects/craft/osdface/pretrained \
+        --conditioner_path checkpoints/textcond_final/checkpoint-50000/text_conditioner.pth \
+        --film_neg_weight 0.1 \
         --gpu_ids 0 \
         --mixed_precision fp16
 
@@ -24,6 +37,20 @@ Usage:
         --ckpt_path pretrained \
         --no_text_cond
 
+    python3 -c "
+import json
+with open('/projectnb/cs585/projects/craft/data/test/CelebA/celeba_prompts_output.json') as f:
+    data = json.load(f)
+match = next(item for item in data if item['image'] == '00000037.png')
+swapped = [{
+    'image': '00000037.png',
+    'pos': match['na'],
+    'na':  match['pos']
+}]
+with open('/tmp/swapped_prompt.json', 'w') as f:
+    json.dump(swapped, f)
+print('Done')
+"
 
     python3 -c "
 import json
@@ -42,13 +69,13 @@ print('Done')
 
 python infer_textcond.py \
     --input_image /projectnb/cs585/projects/craft/data/train/LQ_images_512x512/00020_LQ.png \
-    --output_dir results/textcondv4_test/swapped \
+    --output_dir results/textcondv5_test/swapped \
     --prompts_json /tmp/swapped_prompt.json \
-    --ckpt_path pretrained \
-    --conditioner_path checkpoints/textcond_v4/checkpoint-10000/text_conditioner.pth \
+    --pretrained_model_name_or_path /projectnb/cs585/projects/craft/osdface/pretrained/sd21\
+    --img_encoder_weight /projectnb/cs585/projects/craft/osdface/pretrained/associate_2.ckpt \
+    --ckpt_path /projectnb/cs585/projects/craft/osdface/pretrained \
+    --conditioner_path checkpoints/textcond_v5/checkpoint-50000/text_conditioner.pth \
     --film_neg_weight 0.5 \
-    --pretrained_model_name_or_path pretrained/sd21 \
-    --img_encoder_weight pretrained/associate_2.ckpt \
     --gpu_ids 0 --mixed_precision fp16
 """
 
@@ -95,6 +122,7 @@ def strip_preamble(text: str) -> str:
         if idx != -1:
             return text[idx + len(marker):].strip()
     return text.strip()
+    # return text
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +299,21 @@ class OSDFace_TextCond(nn.Module):
             )
 
         self.timesteps = 399
+
+    # @torch.no_grad()
+    # def _encode_text(self, prompts: list) -> torch.Tensor:
+    #     input_ids = self.tokenizer(
+    #         prompts,
+    #         padding="max_length",
+    #         max_length=self.tokenizer.model_max_length,
+    #         truncation=True,
+    #         return_tensors="pt",
+    #     ).input_ids.to(self.device)
+
+    #     hidden = self.text_encoder(input_ids).last_hidden_state  # (B, 77, 1024)
+    #     pooled = hidden.mean(dim=1)  # (B, 1024) — matches train_textcond.py
+    #     pooled = pooled.unsqueeze(1).expand(-1, self.tokenizer.model_max_length, -1)
+    #     return pooled.to(self.weight_dtype)
 
     @torch.no_grad()
     def _encode_text(self, prompts: list) -> torch.Tensor:

@@ -16,3 +16,9 @@ for weight in -1.0 -0.7 -0.5 -0.3 0.0 0.5 0.9; do
         --gpu_ids 0 \
         --mixed_precision fp16
 done
+
+cp -r /projectnb/cs585/students/hannasam/CRAFT/eval_outputs_final \
+      /projectnb/cs585/projects/craft/text_cond
+
+      cp -r /projectnb/cs585/students/hannasam/CRAFT/checkpoints/textcond_final \
+      /projectnb/cs585/projects/craft/text_cond

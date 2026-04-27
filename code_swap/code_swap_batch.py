@@ -152,20 +152,25 @@ def make_panel(images_with_labels, header, cell=320, label_h=26,
 # ----------------------------------------------------------------------
 
 @torch.no_grad()
-def encode_quantize_decode(model, x_neg11, x_01, override=None):
+def encode_quantize_decode(model, x_neg11, x_01, override=None, parser_x_01=None):
     """
     Run encode → per-region quantize (with optional index override) → decode.
 
-    override : dict | None
+    override     : dict | None
         region_name -> {level_idx: int_or_tensor}.  int = replace every
         position with that code id; tensor = per-position replacement.
+    parser_x_01  : tensor | None
+        Optional separate [0,1] image fed to the face parser. Defaults to
+        x_01. Useful when the encoder input is LQ (so BiSeNet would fail)
+        but you have a paired HQ image with valid region masks.
 
     Returns (x_rec, info).
     """
     quant = model.quantizer
     z = model.encode(x_neg11)
     B, C, H, W = z.shape
-    masks = quant.face_parser.get_region_masks(x_01, target_h=H, target_w=W)
+    parser_input = parser_x_01 if parser_x_01 is not None else x_01
+    masks = quant.face_parser.get_region_masks(parser_input, target_h=H, target_w=W)
 
     z_flat   = z.permute(0, 2, 3, 1).reshape(B, H * W, C)
     z_q_flat = torch.zeros_like(z_flat)
@@ -243,15 +248,24 @@ def process_one(
     lq_disp = lq_pil.resize((args.resolution, args.resolution), Image.BICUBIC)
     lq_disp.save(os.path.join(out_dir, "original_lq.png"))
 
-    # --- HQ (optional, just for the panel) ---
+    # --- HQ (optional, for the panel and/or the parser) ---
     hq_disp = None
+    parser_x01 = None
     if hq_path:
         hq_pil = Image.open(hq_path).convert("RGB")
         hq_disp = hq_pil.resize((args.resolution, args.resolution), Image.BICUBIC)
         hq_disp.save(os.path.join(out_dir, "original_hq.png"))
+        if args.use_hq_for_parser:
+            hq_t = to_tensor(hq_pil).unsqueeze(0).to(device)
+            if hq_t.shape[-2:] != (args.resolution, args.resolution):
+                hq_t = F.interpolate(hq_t, size=(args.resolution, args.resolution),
+                                     mode="bilinear", align_corners=False)
+            parser_x01 = hq_t
 
     # --- Baseline ---
-    x_baseline, baseline_info = encode_quantize_decode(model, x11, x01, override=None)
+    x_baseline, baseline_info = encode_quantize_decode(
+        model, x11, x01, override=None, parser_x_01=parser_x01,
+    )
     baseline_pil = tensor_neg11_to_pil(x_baseline)
     baseline_pil.save(os.path.join(out_dir, "recon_baseline.png"))
 
@@ -286,7 +300,9 @@ def process_one(
 
         for d in donor_ids:
             x_swap, _ = encode_quantize_decode(
-                model, x11, x01, override={region: {args.level: int(d)}}
+                model, x11, x01,
+                override={region: {args.level: int(d)}},
+                parser_x_01=parser_x01,
             )
             cells.append((tensor_neg11_to_pil(x_swap),
                           f"L{args.level} ← code {d}"))
@@ -382,6 +398,10 @@ def main():
                     help="Cap how many images to process (0 = no cap).")
     ap.add_argument("--skip_existing", action="store_true",
                     help="Skip images whose output folder already has swap_indices.json.")
+    ap.add_argument("--use_hq_for_parser", action="store_true",
+                    help="Feed the HQ image (from --hq_dir) to the face parser "
+                         "while the encoder still sees the LQ image. Recommended "
+                         "for LQ inputs where BiSeNet fails. Requires --hq_dir.")
 
     ap.add_argument("--resolution", type=int, default=512)
     ap.add_argument("--device",     default="cuda")

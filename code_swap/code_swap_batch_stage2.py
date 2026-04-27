@@ -314,6 +314,12 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
         "n_positions_per_region": n_positions,
     }
 
+    # Decide which RQ levels each swap should overwrite.
+    levels_to_swap = (
+        list(range(gen.stage1.vqvae.quantizer.region_codebooks[args.regions[0]].n_levels))
+        if args.swap_all_levels else [args.level]
+    )
+
     quant = gen.stage1.vqvae.quantizer
     for region in args.regions:
         if region not in quant.region_codebooks:
@@ -322,6 +328,9 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
             continue
 
         rq = quant.region_codebooks[region]
+        # Donor space is defined at args.level (where labels are reported);
+        # for --swap_all_levels we fan the donor id out to every level whose
+        # codebook is large enough.
         max_codes = rq.levels[args.level].n_codes
         if user_donor_ids is not None:
             donor_ids = [c for c in user_donor_ids if 0 <= c < max_codes]
@@ -335,25 +344,51 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
         cells.append((baseline_pil,  "Stage-2 baseline"))
 
         for d in donor_ids:
+            override_levels = {}
+            for lvl in levels_to_swap:
+                # Clip donor id to this level's codebook size in case sizes differ.
+                lvl_max = rq.levels[lvl].n_codes
+                override_levels[lvl] = int(d) % lvl_max
+            override = {region: override_levels}
+            if args.swap_all_regions:
+                # Overwrite every region's chosen levels with the same donor id.
+                override = {
+                    r: {lvl: int(d) % quant.region_codebooks[r].levels[lvl].n_codes
+                         for lvl in levels_to_swap}
+                    for r in args.regions
+                    if r in quant.region_codebooks and n_positions.get(r, 0) > 0
+                }
+
             p_L_swap, _, _ = build_prompt_with_swap(
                 gen, x11, x01,
-                override={region: {args.level: int(d)}},
+                override=override,
                 parser_x_01=parser_x01,
             )
             x_swap = stage2_reconstruct_from_prompt(gen, x11, p_L_swap)
+            label_lvls = ",".join(f"L{l}" for l in levels_to_swap)
             cells.append((tensor_neg11_to_pil(x_swap),
-                          f"L{args.level} ← code {d}"))
+                          f"{label_lvls} ← {d}"))
 
-        header = (f"Region: {region}    swap level {args.level}    "
-                  f"({n_positions[region]} positions)    [Stage-2 reconstruction]")
+        scope_str = "all regions" if args.swap_all_regions else f"region: {region}"
+        levels_str = (
+            "all RQ levels" if args.swap_all_levels else f"level {args.level}"
+        )
+        header = (f"{scope_str}    swap {levels_str}    "
+                  f"({n_positions[region]} positions in {region})    "
+                  f"[Stage-2 reconstruction]")
         panel = make_panel(cells, header)
         panel.save(os.path.join(out_dir, f"swap_panel_{region}.png"))
 
         summary["regions"][region] = {
             "donor_ids": donor_ids,
+            "levels_swapped": levels_to_swap,
+            "swap_all_regions": bool(args.swap_all_regions),
             "top_used_codes_at_this_level": get_top_codes(rq, args.level, k=16),
             "original_indices": baseline_indices[region],
         }
+        if args.swap_all_regions:
+            # Avoid duplicate panels — one panel covers them all.
+            break
 
     with open(os.path.join(out_dir, "swap_indices.json"), "w") as f:
         json.dump(summary, f, indent=2)
@@ -456,6 +491,14 @@ def main():
     ap.add_argument("--use_hq_for_parser", action="store_true",
                     help="Feed HQ (from --hq_dir) to the face parser while "
                          "the encoder still sees LQ. Recommended for LQ inputs.")
+    ap.add_argument("--swap_all_levels", action="store_true",
+                    help="Replace all 3 RQ levels (not just --level) with the "
+                         "donor id. Stronger swap; useful when --level alone "
+                         "produces no visible change in Stage-2 outputs.")
+    ap.add_argument("--swap_all_regions", action="store_true",
+                    help="Overwrite every region's codes (at the chosen level(s)) "
+                         "with the donor id. Maximum-aggressiveness swap; "
+                         "produces a single panel rather than one per region.")
 
     # --- Run config ---
     ap.add_argument("--max_images",     type=int, default=0,

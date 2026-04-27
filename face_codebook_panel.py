@@ -462,7 +462,9 @@ def main():
     print(f"Active regions: {regions}")
 
     # --- Test data ---
-    ds = FFHQPairedDataset(args.test_root, hq_only=True, masks_folder="")
+    # `--test_root` is treated as a flat directory of PNGs (no images512x512/
+    # subfolder). Pass hq_folder="" so the dataset globs the root directly.
+    ds = FFHQPairedDataset(args.test_root, hq_folder="", hq_only=True, masks_folder="")
     bank_size = min(args.bank_images, len(ds))
     bank_ds = Subset(ds, range(bank_size))
     bank_loader = DataLoader(bank_ds, batch_size=args.batch_size,

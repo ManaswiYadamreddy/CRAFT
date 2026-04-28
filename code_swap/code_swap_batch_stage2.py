@@ -373,11 +373,22 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
         levels_str = (
             "all RQ levels" if args.swap_all_levels else f"level {args.level}"
         )
-        header = (f"{scope_str}    swap {levels_str}    "
-                  f"({n_positions[region]} positions in {region})    "
-                  f"[Stage-2 reconstruction]")
+        if args.swap_all_regions:
+            total_pos = sum(
+                n_positions.get(r, 0) for r in args.regions
+                if r in quant.region_codebooks
+            )
+            header = (f"{scope_str}    swap {levels_str}    "
+                      f"({total_pos} positions across {', '.join(args.regions)})    "
+                      f"[Stage-2 reconstruction]")
+            panel_filename = "swap_panel_all_regions.png"
+        else:
+            header = (f"{scope_str}    swap {levels_str}    "
+                      f"({n_positions[region]} positions in {region})    "
+                      f"[Stage-2 reconstruction]")
+            panel_filename = f"swap_panel_{region}.png"
         panel = make_panel(cells, header)
-        panel.save(os.path.join(out_dir, f"swap_panel_{region}.png"))
+        panel.save(os.path.join(out_dir, panel_filename))
 
         summary["regions"][region] = {
             "donor_ids": donor_ids,

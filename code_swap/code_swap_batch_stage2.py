@@ -255,6 +255,58 @@ def get_top_codes(rq, level, k=8):
     return counts.argsort(descending=True)[:k].tolist()
 
 
+def pick_donors(rq, level, k=4, strategy="top_used", original_ids=None, seed=0):
+    """
+    Select donor code ids for swapping.
+
+    strategy:
+        "top_used" : top-k most-used codes (by EMA count). Cluster near the
+                     codebook mean → safe but visually muted swaps.
+        "random"   : random sample over codes with non-trivial EMA count
+                     (avoids dead codes). More diverse, often louder.
+        "far"      : codes maximally far (cosine distance) from the most-used
+                     code, restricted to the alive subset. Strongest swap.
+        "far_from_baseline":
+                     codes maximally far from the *originally selected codes*
+                     at the swap positions. Per-image, image-specific.
+    """
+    counts = rq.levels[level].ema_count.detach().cpu()
+    weight = rq.levels[level].embedding.weight.detach().cpu().float()
+    n_codes = counts.shape[0]
+    alive = (counts > counts.median() * 0.05).nonzero(as_tuple=True)[0].tolist()
+    if len(alive) < k:
+        alive = list(range(n_codes))
+
+    if strategy == "top_used":
+        return get_top_codes(rq, level, k=k)
+
+    if strategy == "random":
+        g = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(len(alive), generator=g).tolist()
+        return [alive[i] for i in perm[:k]]
+
+    if strategy == "far":
+        anchor_id = int(counts.argmax().item())
+        anchor = weight[anchor_id]
+        sims = (weight @ anchor / (weight.norm(dim=1) * anchor.norm() + 1e-8))
+        sims_alive = [(i, float(sims[i])) for i in alive if i != anchor_id]
+        sims_alive.sort(key=lambda t: t[1])  # ascending = farthest first
+        return [i for i, _ in sims_alive[:k]]
+
+    if strategy == "far_from_baseline":
+        if not original_ids:
+            return get_top_codes(rq, level, k=k)
+        # Mean of the original code vectors used at the swap positions
+        ids = torch.tensor(original_ids, dtype=torch.long)
+        anchor = weight[ids].mean(dim=0)
+        sims = (weight @ anchor / (weight.norm(dim=1) * anchor.norm() + 1e-8))
+        sims_alive = [(i, float(sims[i])) for i in alive if i not in original_ids]
+        sims_alive.sort(key=lambda t: t[1])  # ascending = farthest first
+        return [i for i, _ in sims_alive[:k]]
+
+    raise ValueError(f"unknown donor strategy: {strategy}")
+
+
 # ----------------------------------------------------------------------
 # Per-image driver
 # ----------------------------------------------------------------------
@@ -335,7 +387,17 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
         if user_donor_ids is not None:
             donor_ids = [c for c in user_donor_ids if 0 <= c < max_codes]
         else:
-            donor_ids = get_top_codes(rq, args.level, k=args.n_donors)
+            # baseline_indices[region] is a list of length n_levels of lists.
+            orig_ids_at_level = (
+                baseline_indices[region][args.level]
+                if region in baseline_indices else None
+            )
+            donor_ids = pick_donors(
+                rq, args.level,
+                k=args.n_donors,
+                strategy=args.donor_strategy,
+                original_ids=orig_ids_at_level,
+            )
 
         cells = []
         if hq_disp is not None:
@@ -498,7 +560,17 @@ def main():
                          "level used as donors per region.")
     ap.add_argument("--donor_codes", type=str, default="",
                     help="Comma-separated explicit donor ids "
-                         "(overrides --n_donors).")
+                         "(overrides --n_donors and --donor_strategy).")
+    ap.add_argument("--donor_strategy",
+                    choices=["top_used", "random", "far", "far_from_baseline"],
+                    default="top_used",
+                    help="How to pick donors:\n"
+                         "  top_used : top-N most-used codes (default; muted).\n"
+                         "  random   : random sample of alive codes.\n"
+                         "  far      : codes farthest from the most-used code.\n"
+                         "  far_from_baseline: codes farthest from the codes "
+                         "actually used at swap positions for THIS image. "
+                         "Strongest signal in Stage-2.")
     ap.add_argument("--use_hq_for_parser", action="store_true",
                     help="Feed HQ (from --hq_dir) to the face parser while "
                          "the encoder still sees LQ. Recommended for LQ inputs.")

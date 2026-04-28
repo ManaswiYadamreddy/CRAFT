@@ -324,7 +324,7 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
     else:
         donor_ids = get_top_codes(anchor_rq, 0, k=args.n_donors)
 
-    # --- One panel per image: every region's every RQ level swapped ---
+    # ---------------- Panel 1: ALL regions, all RQ levels swapped ----------------
     cells = []
     if hq_disp is not None:
         cells.append((hq_disp, "HQ (ground truth)"))
@@ -355,6 +355,39 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
     panel = make_panel(cells, header)
     panel.save(os.path.join(out_dir, "swap_panel_all_regions.png"))
 
+    # ---------------- Panel 2..N: one region at a time, all RQ levels swapped ----
+    # Keeps other regions' codes original; only this region's three levels move.
+    # Same donor ids reused so columns are directly comparable across panels.
+    for region in active_regions:
+        rq_target = quant.region_codebooks[region]
+        cells_r = []
+        if hq_disp is not None:
+            cells_r.append((hq_disp, "HQ (ground truth)"))
+        cells_r.append((lq_disp,       "LQ (input)"))
+        cells_r.append((baseline_pil,  "Stage-2 baseline"))
+
+        for d in donor_ids:
+            override = {
+                region: {
+                    lvl: int(d) % rq_target.levels[lvl].n_codes
+                    for lvl in range(rq_target.n_levels)
+                }
+            }
+            p_L_swap, _, _ = build_prompt_with_swap(
+                gen, x11, x01, override=override, parser_x_01=parser_x01,
+            )
+            x_swap = stage2_reconstruct_from_prompt(gen, x11, p_L_swap)
+            cells_r.append((tensor_neg11_to_pil(x_swap),
+                            f"{region} · all levels ← code {d}"))
+
+        header_r = (
+            f"region: {region}    all RQ levels swapped    "
+            f"({n_positions[region]} positions)    "
+            f"[other regions intact · Stage-2 reconstruction]"
+        )
+        panel_r = make_panel(cells_r, header_r)
+        panel_r.save(os.path.join(out_dir, f"swap_panel_{region}.png"))
+
     summary = {
         "lq_image": os.path.abspath(lq_path),
         "hq_image": os.path.abspath(hq_path) if hq_path else None,
@@ -364,6 +397,10 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
         "n_positions_per_region": n_positions,
         "original_indices": {r: baseline_indices[r] for r in active_regions
                              if r in baseline_indices},
+        "panels_written": (
+            ["swap_panel_all_regions.png"]
+            + [f"swap_panel_{r}.png" for r in active_regions]
+        ),
     }
     with open(os.path.join(out_dir, "swap_indices.json"), "w") as f:
         json.dump(summary, f, indent=2)

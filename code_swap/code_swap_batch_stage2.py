@@ -1,45 +1,42 @@
 """
 code_swap_batch_stage2.py — Code-swap reconstruction experiment over a folder
-of LQ face images, **using the CRAFT Stage-2 diffusion generator** for the
-reconstruction (instead of the Stage-1 LQ decoder).
+of LQ face images, using the CRAFT Stage-2 diffusion generator.
 
-Pipeline (per image):
+This script does ONE thing: for each face it produces a panel that compares
+the Stage-2 baseline reconstruction with several reconstructions where the
+**entire visual prompt** has been overwritten — every region's codes at
+every RQ level are replaced with one donor code id, then the rest of
+Stage-2 (prompt projector → SD UNet + LoRA → one-step denoise → VAE
+decode) runs as usual.
 
-    LQ image
-        → [Stage-1 LQ encoder]                  z (B, 512, 16, 16)
-        → [Face parser, optionally on HQ]       region masks
-        → for each region:  ResidualVQ.encode → 3 levels of code ids
-        →     [SWAP]   replace level-L ids with one donor code id
-        → ResidualVQ.decode                    quantized features
-        → magnitude head + reshape             p_L (B, 256, 512)
-        → [TRAINED]  prompt projector + LN     context (B, 256, 1024 or 768)
-        → [TRAINED]  SD UNet (with LoRA)       eps_pred at t = T_L
-        → one-step denoise (OSDFace Eq. 2)      z_hat_H (B, 4, 64, 64)
-        → [FROZEN]  SD VAE decoder              I_hat_H (B, 3, 512, 512)
+(Per-region / per-level swaps were tried and produce no visible change
+in Stage-2 outputs — the diffusion path leans on the LQ latent z_L for
+geometry. Only a near-total prompt swap moves the output, so that's the
+only mode this script supports.)
 
-Self-contained — only depends on `models/` (and the same diffusers / peft
-deps that train_stage2 used). LQ ↔ HQ filenames are assumed identical
-between --input_dir and --hq_dir (no prefix/suffix mangling).
+Self-contained — only depends on `models/`. LQ ↔ HQ filenames are assumed
+identical between --input_dir and --hq_dir.
 
 Output layout (per image, under <out_dir>/<stem>/):
     original_lq.png
     original_hq.png            (only if --hq_dir given)
     recon_baseline.png         Stage-2 reconstruction with no swap
-    swap_panel_<region>.png    HQ | LQ | Stage-2 baseline | donor_1 | …
+    swap_panel_all_regions.png HQ | LQ | Stage-2 baseline | donor_1 | …
     swap_indices.json          donors used + original code-id grid per region
 
 Example:
     python code_swap/code_swap_batch_stage2.py \
-        --stage1_ckpt   /projectnb/cs585/projects/craft/checkpoints/phase_d/final.pt \
-        --stage2_ckpt   /projectnb/cs585/projects/craft/checkpoints_stage2/final.pt \
-        --parser_ckpt   /projectnb/cs585/projects/craft/pretrained/79999_iter.pth \
-        --input_dir     /projectnb/cs585/projects/craft/data/test/CelebA/Self_CelebA_Validation_v2/self_celeba_512_v2/ \
-        --hq_dir        /projectnb/cs585/projects/craft/data/test/CelebA/CelebA_Validation/celeba_512_validation/ \
-        --out_dir       /projectnb/cs585/projects/craft/code_swap_outputs/celeba_lq_stage2 \
-        --regions       eyes lips hair \
-        --level         0 \
-        --n_donors      4 \
-        --max_images    20 \
+        --stage1_ckpt      /projectnb/cs585/projects/craft/checkpoints/phase_d/final.pt \
+        --stage2_ckpt      /projectnb/cs585/projects/craft/checkpoints_stage2/final.pt \
+        --parser_ckpt      /projectnb/cs585/projects/craft/pretrained/79999_iter.pth \
+        --pretrained_model /projectnb/cs585/projects/craft/pretrained/stable-diffusion-v1-5 \
+        --context_dim      768 \
+        --input_dir        /projectnb/cs585/projects/craft/data/test/CelebA/Self_CelebA_Validation_v2/self_celeba_512_v2/ \
+        --hq_dir           /projectnb/cs585/projects/craft/data/test/CelebA/CelebA_Validation/celeba_512_validation/ \
+        --out_dir          /projectnb/cs585/projects/craft/code_swap_outputs/celeba_lq_stage2_allregions \
+        --regions          eyes lips hair skin \
+        --n_donors         4 \
+        --max_images       10 \
         --use_hq_for_parser \
         --skip_existing
 """
@@ -255,58 +252,6 @@ def get_top_codes(rq, level, k=8):
     return counts.argsort(descending=True)[:k].tolist()
 
 
-def pick_donors(rq, level, k=4, strategy="top_used", original_ids=None, seed=0):
-    """
-    Select donor code ids for swapping.
-
-    strategy:
-        "top_used" : top-k most-used codes (by EMA count). Cluster near the
-                     codebook mean → safe but visually muted swaps.
-        "random"   : random sample over codes with non-trivial EMA count
-                     (avoids dead codes). More diverse, often louder.
-        "far"      : codes maximally far (cosine distance) from the most-used
-                     code, restricted to the alive subset. Strongest swap.
-        "far_from_baseline":
-                     codes maximally far from the *originally selected codes*
-                     at the swap positions. Per-image, image-specific.
-    """
-    counts = rq.levels[level].ema_count.detach().cpu()
-    weight = rq.levels[level].embedding.weight.detach().cpu().float()
-    n_codes = counts.shape[0]
-    alive = (counts > counts.median() * 0.05).nonzero(as_tuple=True)[0].tolist()
-    if len(alive) < k:
-        alive = list(range(n_codes))
-
-    if strategy == "top_used":
-        return get_top_codes(rq, level, k=k)
-
-    if strategy == "random":
-        g = torch.Generator().manual_seed(seed)
-        perm = torch.randperm(len(alive), generator=g).tolist()
-        return [alive[i] for i in perm[:k]]
-
-    if strategy == "far":
-        anchor_id = int(counts.argmax().item())
-        anchor = weight[anchor_id]
-        sims = (weight @ anchor / (weight.norm(dim=1) * anchor.norm() + 1e-8))
-        sims_alive = [(i, float(sims[i])) for i in alive if i != anchor_id]
-        sims_alive.sort(key=lambda t: t[1])  # ascending = farthest first
-        return [i for i, _ in sims_alive[:k]]
-
-    if strategy == "far_from_baseline":
-        if not original_ids:
-            return get_top_codes(rq, level, k=k)
-        # Mean of the original code vectors used at the swap positions
-        ids = torch.tensor(original_ids, dtype=torch.long)
-        anchor = weight[ids].mean(dim=0)
-        sims = (weight @ anchor / (weight.norm(dim=1) * anchor.norm() + 1e-8))
-        sims_alive = [(i, float(sims[i])) for i in alive if i not in original_ids]
-        sims_alive.sort(key=lambda t: t[1])  # ascending = farthest first
-        return [i for i, _ in sims_alive[:k]]
-
-    raise ValueError(f"unknown donor strategy: {strategy}")
-
-
 # ----------------------------------------------------------------------
 # Per-image driver
 # ----------------------------------------------------------------------
@@ -335,7 +280,7 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
     lq_disp = lq_pil.resize((args.resolution, args.resolution), Image.BICUBIC)
     lq_disp.save(os.path.join(out_dir, "original_lq.png"))
 
-    # --- HQ (optional) ---
+    # --- HQ (optional, used for the panel and optionally the parser) ---
     hq_disp = None
     parser_x01 = None
     if hq_path:
@@ -349,7 +294,7 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
                                      mode="bilinear", align_corners=False)
             parser_x01 = hq_t
 
-    # --- Baseline (Stage-2) ---
+    # --- Baseline (Stage-2, no swap) ---
     p_L_base, baseline_indices, n_positions = build_prompt_with_swap(
         gen, x11, x01, override=None, parser_x_01=parser_x01,
     )
@@ -357,112 +302,69 @@ def process_one(gen, lq_path, out_root, args, hq_path=None,
     baseline_pil = tensor_neg11_to_pil(x_baseline)
     baseline_pil.save(os.path.join(out_dir, "recon_baseline.png"))
 
+    quant = gen.stage1.vqvae.quantizer
+    active_regions = [
+        r for r in args.regions
+        if r in quant.region_codebooks and n_positions.get(r, 0) > 0
+    ]
+    if not active_regions:
+        # Fall back to whatever regions actually have positions on this face.
+        active_regions = [
+            r for r in REGION_NAMES
+            if r in quant.region_codebooks and n_positions.get(r, 0) > 0
+        ]
+
+    # Donor ids are picked from the first active region's level-0 codebook.
+    # When the swap is applied to a region, the same donor id is used at
+    # every RQ level (mod that level's codebook size, in case sizes differ).
+    anchor_rq = quant.region_codebooks[active_regions[0]]
+    if user_donor_ids is not None:
+        donor_ids = [c for c in user_donor_ids
+                     if 0 <= c < anchor_rq.levels[0].n_codes]
+    else:
+        donor_ids = get_top_codes(anchor_rq, 0, k=args.n_donors)
+
+    # --- One panel per image: every region's every RQ level swapped ---
+    cells = []
+    if hq_disp is not None:
+        cells.append((hq_disp, "HQ (ground truth)"))
+    cells.append((lq_disp,       "LQ (input)"))
+    cells.append((baseline_pil,  "Stage-2 baseline"))
+
+    for d in donor_ids:
+        override = {
+            r: {
+                lvl: int(d) % quant.region_codebooks[r].levels[lvl].n_codes
+                for lvl in range(quant.region_codebooks[r].n_levels)
+            }
+            for r in active_regions
+        }
+        p_L_swap, _, _ = build_prompt_with_swap(
+            gen, x11, x01, override=override, parser_x_01=parser_x01,
+        )
+        x_swap = stage2_reconstruct_from_prompt(gen, x11, p_L_swap)
+        cells.append((tensor_neg11_to_pil(x_swap),
+                      f"all regions · all levels ← code {d}"))
+
+    total_pos = sum(n_positions.get(r, 0) for r in active_regions)
+    header = (
+        f"all regions · all RQ levels swapped    "
+        f"({total_pos} positions across {', '.join(active_regions)})    "
+        f"[Stage-2 reconstruction]"
+    )
+    panel = make_panel(cells, header)
+    panel.save(os.path.join(out_dir, "swap_panel_all_regions.png"))
+
     summary = {
         "lq_image": os.path.abspath(lq_path),
         "hq_image": os.path.abspath(hq_path) if hq_path else None,
         "stage2_ckpt": os.path.abspath(args.stage2_ckpt),
-        "level": args.level,
-        "regions": {},
+        "regions_swapped": active_regions,
+        "donor_ids": donor_ids,
         "n_positions_per_region": n_positions,
+        "original_indices": {r: baseline_indices[r] for r in active_regions
+                             if r in baseline_indices},
     }
-
-    # Decide which RQ levels each swap should overwrite.
-    levels_to_swap = (
-        list(range(gen.stage1.vqvae.quantizer.region_codebooks[args.regions[0]].n_levels))
-        if args.swap_all_levels else [args.level]
-    )
-
-    quant = gen.stage1.vqvae.quantizer
-    for region in args.regions:
-        if region not in quant.region_codebooks:
-            continue
-        if n_positions.get(region, 0) == 0:
-            continue
-
-        rq = quant.region_codebooks[region]
-        # Donor space is defined at args.level (where labels are reported);
-        # for --swap_all_levels we fan the donor id out to every level whose
-        # codebook is large enough.
-        max_codes = rq.levels[args.level].n_codes
-        if user_donor_ids is not None:
-            donor_ids = [c for c in user_donor_ids if 0 <= c < max_codes]
-        else:
-            # baseline_indices[region] is a list of length n_levels of lists.
-            orig_ids_at_level = (
-                baseline_indices[region][args.level]
-                if region in baseline_indices else None
-            )
-            donor_ids = pick_donors(
-                rq, args.level,
-                k=args.n_donors,
-                strategy=args.donor_strategy,
-                original_ids=orig_ids_at_level,
-            )
-
-        cells = []
-        if hq_disp is not None:
-            cells.append((hq_disp, "HQ (ground truth)"))
-        cells.append((lq_disp,       "LQ (input)"))
-        cells.append((baseline_pil,  "Stage-2 baseline"))
-
-        for d in donor_ids:
-            override_levels = {}
-            for lvl in levels_to_swap:
-                # Clip donor id to this level's codebook size in case sizes differ.
-                lvl_max = rq.levels[lvl].n_codes
-                override_levels[lvl] = int(d) % lvl_max
-            override = {region: override_levels}
-            if args.swap_all_regions:
-                # Overwrite every region's chosen levels with the same donor id.
-                override = {
-                    r: {lvl: int(d) % quant.region_codebooks[r].levels[lvl].n_codes
-                         for lvl in levels_to_swap}
-                    for r in args.regions
-                    if r in quant.region_codebooks and n_positions.get(r, 0) > 0
-                }
-
-            p_L_swap, _, _ = build_prompt_with_swap(
-                gen, x11, x01,
-                override=override,
-                parser_x_01=parser_x01,
-            )
-            x_swap = stage2_reconstruct_from_prompt(gen, x11, p_L_swap)
-            label_lvls = ",".join(f"L{l}" for l in levels_to_swap)
-            cells.append((tensor_neg11_to_pil(x_swap),
-                          f"{label_lvls} ← {d}"))
-
-        scope_str = "all regions" if args.swap_all_regions else f"region: {region}"
-        levels_str = (
-            "all RQ levels" if args.swap_all_levels else f"level {args.level}"
-        )
-        if args.swap_all_regions:
-            total_pos = sum(
-                n_positions.get(r, 0) for r in args.regions
-                if r in quant.region_codebooks
-            )
-            header = (f"{scope_str}    swap {levels_str}    "
-                      f"({total_pos} positions across {', '.join(args.regions)})    "
-                      f"[Stage-2 reconstruction]")
-            panel_filename = "swap_panel_all_regions.png"
-        else:
-            header = (f"{scope_str}    swap {levels_str}    "
-                      f"({n_positions[region]} positions in {region})    "
-                      f"[Stage-2 reconstruction]")
-            panel_filename = f"swap_panel_{region}.png"
-        panel = make_panel(cells, header)
-        panel.save(os.path.join(out_dir, panel_filename))
-
-        summary["regions"][region] = {
-            "donor_ids": donor_ids,
-            "levels_swapped": levels_to_swap,
-            "swap_all_regions": bool(args.swap_all_regions),
-            "top_used_codes_at_this_level": get_top_codes(rq, args.level, k=16),
-            "original_indices": baseline_indices[region],
-        }
-        if args.swap_all_regions:
-            # Avoid duplicate panels — one panel covers them all.
-            break
-
     with open(os.path.join(out_dir, "swap_indices.json"), "w") as f:
         json.dump(summary, f, indent=2)
     return "done"
@@ -516,9 +418,13 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Batch code-swap experiment using the Stage-2 diffusion generator."
+        description=("Batch code-swap experiment using the Stage-2 diffusion "
+                     "generator. Always swaps every region's every RQ level "
+                     "with one donor code id (the only mode that produces "
+                     "visible Stage-2 differences)."),
     )
-    # --- Stage-1 (used as the frozen tokenizer inside Stage-2) ---
+
+    # --- Stage-1 (frozen tokenizer inside Stage-2) ---
     ap.add_argument("--stage1_ckpt", required=True,
                     help="CRAFT Stage-1 checkpoint (phase_d/final.pt).")
     ap.add_argument("--parser_ckpt", required=True,
@@ -529,13 +435,11 @@ def main():
                     help="train_stage2.py final.pt (the bundle dict).")
     ap.add_argument("--pretrained_model",
                     default="sd-legacy/stable-diffusion-v1-5",
-                    help="Local SD directory or HF id. Match the Stage-2 "
-                         "training setup (SD 1.5 = 768, SD 2.x = 1024).")
+                    help="Local SD directory or HF id.")
     ap.add_argument("--mixed_precision", choices=["fp16", "fp32"], default="fp16")
     ap.add_argument("--lora_rank",  type=int,   default=16)
     ap.add_argument("--lora_alpha", type=float, default=16)
-    ap.add_argument("--t_fixed",    type=int,   default=999,
-                    help="One-step DDIM timestep (matches training t_low).")
+    ap.add_argument("--t_fixed",    type=int,   default=999)
     ap.add_argument("--embed_dim",  type=int,   default=512,
                     help="Stage-1 visual-prompt channel count.")
     ap.add_argument("--context_dim", type=int,  default=768,
@@ -546,42 +450,25 @@ def main():
     ap.add_argument("--input_dir", required=True,
                     help="Folder of LQ images.")
     ap.add_argument("--hq_dir",    default="",
-                    help="Optional folder of HQ ground-truth images "
+                    help="Optional folder of HQ images "
                          "(same filenames as in --input_dir).")
     ap.add_argument("--out_dir",   required=True,
                     help="Each image gets its own subfolder under this root.")
 
-    # --- Swap config ---
+    # --- Swap config (kept minimal — only the all-regions, all-levels mode) ---
     ap.add_argument("--regions", nargs="+",
-                    default=["eyes", "lips", "hair", "skin"])
-    ap.add_argument("--level",    type=int, default=0)
+                    default=["eyes", "lips", "hair", "skin"],
+                    help="Regions to include in the swap. The donor id is "
+                         "applied to every region in this list at every "
+                         "RQ level (mod each codebook's size).")
     ap.add_argument("--n_donors", type=int, default=4,
-                    help="Top-N most-used codes (by EMA count) at the chosen "
-                         "level used as donors per region.")
+                    help="Top-N most-used codes (by EMA count) at level 0 "
+                         "of the first listed region used as donor ids.")
     ap.add_argument("--donor_codes", type=str, default="",
-                    help="Comma-separated explicit donor ids "
-                         "(overrides --n_donors and --donor_strategy).")
-    ap.add_argument("--donor_strategy",
-                    choices=["top_used", "random", "far", "far_from_baseline"],
-                    default="top_used",
-                    help="How to pick donors:\n"
-                         "  top_used : top-N most-used codes (default; muted).\n"
-                         "  random   : random sample of alive codes.\n"
-                         "  far      : codes farthest from the most-used code.\n"
-                         "  far_from_baseline: codes farthest from the codes "
-                         "actually used at swap positions for THIS image. "
-                         "Strongest signal in Stage-2.")
+                    help="Comma-separated explicit donor ids (overrides --n_donors).")
     ap.add_argument("--use_hq_for_parser", action="store_true",
                     help="Feed HQ (from --hq_dir) to the face parser while "
                          "the encoder still sees LQ. Recommended for LQ inputs.")
-    ap.add_argument("--swap_all_levels", action="store_true",
-                    help="Replace all 3 RQ levels (not just --level) with the "
-                         "donor id. Stronger swap; useful when --level alone "
-                         "produces no visible change in Stage-2 outputs.")
-    ap.add_argument("--swap_all_regions", action="store_true",
-                    help="Overwrite every region's codes (at the chosen level(s)) "
-                         "with the donor id. Maximum-aggressiveness swap; "
-                         "produces a single panel rather than one per region.")
 
     # --- Run config ---
     ap.add_argument("--max_images",     type=int, default=0,

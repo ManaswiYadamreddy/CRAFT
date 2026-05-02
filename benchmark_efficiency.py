@@ -361,17 +361,32 @@ def main():
 
     in_shape = (3, args.res, args.res)
 
+    # ── Decoder/post_quant_conv subtraction (full-pipeline only) ───────────
+    # In `mode=full`, Stage 2 inference uses ONLY the VRE encoder + quant_conv
+    # + quantizer to extract the visual prompt — `post_quant_conv` and
+    # `decoder` are dead code. The published OSDFace VRE in lq_embed.py is
+    # encoder-only and doesn't pay this tax, so to compare apples-to-apples
+    # we strip the unused VQVAE decoder side from "ours" param counts.
+    # In `mode=vre`, the decoder IS run (encode→quant→decode), so keep it.
+    if args.mode == "full":
+        def _unused_dec_params(vqvae):
+            return count_params(vqvae.decoder) + count_params(vqvae.post_quant_conv)
+        craft_dec_params   = _unused_dec_params(craft)
+        osdface_dec_params = _unused_dec_params(osdface)
+    else:
+        craft_dec_params = osdface_dec_params = 0
+
     # ── Run benchmarks ─────────────────────────────────────────────────────
     # Subtract the (frozen) parser from CRAFT's param count only when we've
     # also excluded it from the timed/MAC path — otherwise it must stay in.
-    craft_excl = p_parser if args.exclude_parser else 0
+    craft_excl = (p_parser if args.exclude_parser else 0) + craft_dec_params
     craft_res   = benchmark_one(
         "CRAFT", craft_w, x, args.n_warmup, args.n_iter, device,
         in_shape, in_dtype, sub_param_to_exclude=craft_excl,
     )
     osdface_res = benchmark_one(
         "OSDFace", osdface_w, x, args.n_warmup, args.n_iter, device,
-        in_shape, in_dtype,
+        in_shape, in_dtype, sub_param_to_exclude=osdface_dec_params,
     )
 
     # ── Report ─────────────────────────────────────────────────────────────
@@ -393,9 +408,14 @@ def main():
         print(f"(CRAFT includes BiSeNet face parser: "
               f"{p_parser/1e6:.2f} M params, run every forward pass.)")
     if args.mode == "full":
-        print("(Full pipeline = VRE + adapter + SD-2.1 VAE encode + UNet "
-              "+ VAE decode.\n SD components and adapter are identical "
-              "between the two rows; only the VRE swaps.)")
+        print("(Full pipeline = VRE encoder + quantizer + adapter "
+              "+ SD-2.1 VAE encode + UNet + VAE decode.\n"
+              " SD components and adapter are identical between the two "
+              "rows; only the VRE swaps.)")
+        print(f"(VRE decoder + post_quant_conv excluded from Param "
+              f"(unused at Stage 2 inference): "
+              f"{craft_dec_params/1e6:.2f} M (CRAFT), "
+              f"{osdface_dec_params/1e6:.2f} M (OSDFace).)")
 
 
 if __name__ == "__main__":

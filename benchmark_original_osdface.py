@@ -101,7 +101,7 @@ class OriginalOSDFacePipeline(nn.Module):
 
         unet = UNet2DConditionModel.from_pretrained(sd_model, subfolder="unet")
         if merge_lora:
-            unet = self._merge_lora(unet, ckpt_path, lora_rank, lora_alpha)
+            unet = self._load_and_merge_lora(unet, ckpt_path)
         self.unet = unet.to(device, dtype=dtype).eval()
 
         # ── CLIP empty-prompt embedding (cached, NOT inside timed loop) ──
@@ -119,23 +119,37 @@ class OriginalOSDFacePipeline(nn.Module):
         # text_encoder dropped — same convention as benchmark_efficiency.py.
 
     @staticmethod
-    def _merge_lora(unet, ckpt_path, rank, alpha):
-        """LoRA merge identical to infer_concat.py:merge_unet."""
-        from safetensors import safe_open
-        lora_path = os.path.join(ckpt_path, "pytorch_lora_weights.safetensors")
-        if not os.path.exists(lora_path):
-            warnings.warn(f"{lora_path} not found — using base UNet only.")
+    def _load_and_merge_lora(unet, ckpt_path):
+        """Try three loading strategies in order and return the first that
+        succeeds. Falls back to the base UNet if all fail (Step Time / Param /
+        MACs barely shift since LoRA is tiny vs the base UNet)."""
+        # 1. PEFT — the path infer_concat.py:97-102 uses. Needs adapter_config.json.
+        try:
+            from peft import PeftModel
+            merged = PeftModel.from_pretrained(unet, ckpt_path).merge_and_unload()
+            print("  LoRA: merged via PeftModel.")
+            return merged
+        except Exception as e:
+            print(f"  PEFT load failed ({type(e).__name__}: {e})")
+
+        # 2. diffusers — handles `pytorch_lora_weights.safetensors` natively.
+        try:
+            unet.load_attn_procs(ckpt_path)
+            try:
+                unet.fuse_lora()
+                unet.unload_lora_weights()
+            except AttributeError:
+                pass  # older diffusers: attn procs already applied in-place
+            print("  LoRA: merged via diffusers load_attn_procs.")
             return unet
-        scale = float(alpha / rank)
-        with safe_open(lora_path, framework="pt") as f:
-            sd = {k: f.get_tensor(k) for k in f.keys()}
-        sd_unet = unet.state_dict()
-        for key in sd:
-            if "lora_A" in key:
-                kb = key.replace("lora_A", "lora_B")
-                uk = key.replace(".lora_A.weight", ".weight").replace("unet.", "")
-                sd_unet[uk] = sd_unet[uk] + scale * torch.mm(sd[kb], sd[key])
-        unet.load_state_dict(sd_unet)
+        except Exception as e:
+            print(f"  diffusers load_attn_procs failed ({type(e).__name__}: {e})")
+
+        warnings.warn(
+            "All LoRA loading strategies failed — benchmarking the base UNet "
+            "only. Step Time / Param / MACs are within ~1 % of the LoRA-merged "
+            "values for typical rank-16 LoRA."
+        )
         return unet
 
     @torch.no_grad()

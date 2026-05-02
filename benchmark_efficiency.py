@@ -190,10 +190,12 @@ class FullPipeline(nn.Module):
         self.embed_proj   = nn.Linear(512, 1024).to(device, dtype=dtype)
 
     @torch.no_grad()
-    def forward(self, lq):
-        B = lq.shape[0]
+    def forward(self, x):
+        # `x` is the LQ image in [-1, 1], shape (B, 3, 512, 512). Named `x`
+        # (not `lq`) so ptflops' input_constructor kwargs match.
+        B = x.shape[0]
         # VRE → (B, 256, 512)
-        tokens = self.vre_tokens(lq).to(self.dtype)
+        tokens = self.vre_tokens(x).to(self.dtype)
         # (B, 256, 512) → (B, 77, 512) → (B, 77, 1024)
         tokens = self.token_reduce(tokens)
         visual_embeds = self.embed_proj(tokens)
@@ -202,7 +204,7 @@ class FullPipeline(nn.Module):
         prompt_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
         # SD VAE encode
         lq_lat = (
-            self.vae.encode(lq.to(self.dtype)).latent_dist.sample()
+            self.vae.encode(x.to(self.dtype)).latent_dist.sample()
             * self.vae.config.scaling_factor
         )
         # UNet single ε-prediction step

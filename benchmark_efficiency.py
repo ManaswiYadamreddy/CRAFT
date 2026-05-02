@@ -40,10 +40,15 @@ Run from inside the CRAFT repo so `models.*` is importable.
 
 Notes
 -----
+* CRAFT uses a frozen BiSeNet face parser at inference (to compute the
+  region masks driving region-aware VQ). The parser is included by default
+  in CRAFT's Step Time / Param / MACs to match the real inference cost.
+  Pass --exclude_parser to precompute masks once outside the timed loop
+  (treats the parser as an upstream module — useful for ablation only).
 * The SD components (UNet + VAE + CLIP) and the (B,256,512)→(B,77,1024)
   adapter are identical for the CRAFT and OSDFace runs — only the VRE
-  swaps. So the difference between the two rows is exactly what's
-  attributable to the VRE choice.
+  (and parser, for CRAFT) swap. The difference between the two rows is
+  exactly what's attributable to that swap.
 * The adapter is a small untrained Conv1d + Linear. Output quality is
   meaningless without a trained Stage 2; we are measuring time / MACs /
   params, not reconstruction fidelity.
@@ -301,8 +306,10 @@ def main():
     ap.add_argument("--res", type=int, default=512)
     ap.add_argument("--n_warmup", type=int, default=10)
     ap.add_argument("--n_iter",   type=int, default=50)
-    ap.add_argument("--include_parser", action="store_true",
-                    help="Include the BiSeNet face parser in CRAFT timing/MACs.")
+    ap.add_argument("--exclude_parser", action="store_true",
+                    help="Exclude the BiSeNet face parser from CRAFT (precompute "
+                         "masks once outside the timed loop). Default: include "
+                         "it, since real inference runs the parser every call.")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -320,13 +327,13 @@ def main():
     x_11_f32 = torch.randn(1, 3, args.res, args.res, device=device)
     x_01     = (x_11_f32.clamp(-1, 1) + 1) / 2
 
-    if args.include_parser:
-        masks = None
-    else:
+    if args.exclude_parser:
         with torch.no_grad():
             masks = craft.quantizer.face_parser.get_region_masks(
                 x_01, target_h=args.res // 32, target_w=args.res // 32,
             )
+    else:
+        masks = None  # parser runs inside every forward pass
     p_parser = count_params(craft.quantizer.face_parser)
 
     # ── Build the wrappers we'll benchmark ─────────────────────────────────
@@ -355,9 +362,9 @@ def main():
     in_shape = (3, args.res, args.res)
 
     # ── Run benchmarks ─────────────────────────────────────────────────────
-    # Exclude face parser from CRAFT's reported param count when masks are
-    # precomputed (paper convention: parser is upstream, not part of the model).
-    craft_excl = 0 if args.include_parser else p_parser
+    # Subtract the (frozen) parser from CRAFT's param count only when we've
+    # also excluded it from the timed/MAC path — otherwise it must stay in.
+    craft_excl = p_parser if args.exclude_parser else 0
     craft_res   = benchmark_one(
         "CRAFT", craft_w, x, args.n_warmup, args.n_iter, device,
         in_shape, in_dtype, sub_param_to_exclude=craft_excl,
@@ -379,9 +386,12 @@ def main():
         print(f"{name:<10} {r['step_s']:>16.4f} "
               f"{r['param']/1e6:>14.2f} {macs_str}")
     print("=" * 64)
-    if not args.include_parser:
+    if args.exclude_parser:
         print(f"(CRAFT excludes BiSeNet face parser: "
-              f"{p_parser/1e6:.2f} M params, masks precomputed.)")
+              f"{p_parser/1e6:.2f} M params, masks precomputed before timing.)")
+    else:
+        print(f"(CRAFT includes BiSeNet face parser: "
+              f"{p_parser/1e6:.2f} M params, run every forward pass.)")
     if args.mode == "full":
         print("(Full pipeline = VRE + adapter + SD-2.1 VAE encode + UNet "
               "+ VAE decode.\n SD components and adapter are identical "

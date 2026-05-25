@@ -14,7 +14,7 @@ Usage:
         --img_encoder_weight /projectnb/cs585/projects/craft/osdface/pretrained/associate_2.ckpt \
         --ckpt_path /projectnb/cs585/projects/craft/osdface/pretrained \
         --conditioner_path checkpoints/textcond_final/checkpoint-50000/text_conditioner.pth \
-        --film_neg_weight 0.5 \
+        --film_neg_weight 0.1 \
         --gpu_ids 0 \
         --mixed_precision fp16
     Test

@@ -1,0 +1,17 @@
+[
+  {
+    "filename":  "00000037.png",
+    "category":  "Text guided correctly",
+    "note":      "Suppressed hallucinated glasses and mouth"
+  },
+  {
+    "filename":  "00001486.png",
+    "category":  "Text deformed output",
+    "note":      "Over-suppressed face structure"
+  },
+  {
+    "filename":  "00001645.png",
+    "category":  "Both agreed",
+    "note":      "Consistent restoration, no conflict"
+  }
+]
